@@ -1637,6 +1637,81 @@ class SettingsDialog(tk.Toplevel):
 
         v_delay.trace_add("write", _upd_delay)
 
+        # グループ7: 起動ショートカット作成
+        g7 = _make_group(scroll_f, "起動ショートカット作成")
+        r_sc = _row_frame(g7)
+        _lbl(r_sc, "デスクトップ起動スクリプト:", "デスクトップにワンクリックで起動できる .bat / .sh ファイルを作成します。")
+
+        def _create_desktop_shortcuts():
+            import sys
+            try:
+                # デスクトップフォルダの取得
+                home = os.path.expanduser("~")
+                desktop_candidates = [
+                    os.path.join(home, "Desktop"),
+                    os.path.join(home, "OneDrive", "Desktop"),
+                    os.path.join(home, "OneDrive", "デスクトップ"),
+                    os.path.join(home, "デスクトップ"),
+                ]
+                desktop_dir = None
+                for d in desktop_candidates:
+                    if os.path.exists(d):
+                        desktop_dir = d
+                        break
+                if not desktop_dir:
+                    desktop_dir = os.path.join(home, "Desktop")
+                    os.makedirs(desktop_dir, exist_ok=True)
+
+                # プロジェクトルートディレクトリ & Python実行ファイルのパス
+                app_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+                python_exe = sys.executable
+
+                created_files = []
+
+                if sys.platform == "win32":
+                    # Windows用 .bat 作成
+                    bat_path = os.path.join(desktop_dir, "AI自動検査システム起動.bat")
+                    bat_content = (
+                        f"@echo off\n"
+                        f"chcp 65001 > nul\n"
+                        f"title AI自動検査システム (PatchCore)\n"
+                        f'cd /d "{app_dir}"\n'
+                        f'"{python_exe}" "main.py"\n'
+                        f"if errorlevel 1 pause\n"
+                    )
+                    with open(bat_path, "w", encoding="utf-8") as f:
+                        f.write(bat_content)
+                    created_files.append(bat_path)
+                else:
+                    # Linux / macOS 用 .sh 作成
+                    sh_path = os.path.join(desktop_dir, "start_inspection_app.sh")
+                    sh_content = (
+                        f"#!/bin/bash\n"
+                        f'cd "{app_dir}"\n'
+                        f'"{python_exe}" "main.py"\n'
+                    )
+                    with open(sh_path, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(sh_content)
+                    try:
+                        os.chmod(sh_path, 0o755)
+                    except Exception:
+                        pass
+                    created_files.append(sh_path)
+
+                msg = "デスクトップに起動スクリプトを作成しました：\n\n" + "\n".join(created_files)
+                messagebox.showinfo("ショートカット作成成功", msg, parent=self)
+            except Exception as ex:
+                messagebox.showerror("作成失敗", f"起動スクリプトの作成中にエラーが発生しました:\n{ex}", parent=self)
+
+        btn_sc = tk.Button(
+            r_sc, text="デスクトップに起動スクリプトを作成", font=FONT_NORMAL,
+            bg=COLOR_ACCENT, fg="#ffffff",
+            relief="flat", padx=10, pady=4, cursor="hand2",
+            command=_create_desktop_shortcuts
+        )
+        btn_sc.pack(side=tk.LEFT, padx=(4, 0))
+        Tooltip(btn_sc, "デスクトップ上に本システムを起動する .bat および .sh ファイルを自動生成します。")
+
     # ---- 保存 / GPIO テスト ----
 
     def _sync_pattern_conditions(self):
