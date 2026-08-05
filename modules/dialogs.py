@@ -41,6 +41,172 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 
+# ---------------------------------------------------------------------------
+# システム日時設定ダイアログ
+# ---------------------------------------------------------------------------
+class SystemDateTimeDialog(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("本体日時設定 (システムクロック設定)")
+        self.geometry("560x490")
+        self.configure(bg=COLOR_BG_MAIN)
+        self.transient(parent)
+        self.grab_set()
+
+        try:
+            configure_modal_toplevel(self)
+        except Exception:
+            pass
+
+        from datetime import datetime
+        now = datetime.now()
+
+        # 最下部ボタンエリア (side=BOTTOM で固定配置することで縦潰れを完全防止)
+        f_btns = tk.Frame(self, bg=COLOR_BG_MAIN)
+        f_btns.pack(side=tk.BOTTOM, fill=tk.X, pady=20, padx=24)
+
+        def _apply():
+            try:
+                y = self.v_year.get()
+                m = self.v_month.get()
+                d = self.v_day.get()
+                h = self.v_hour.get()
+                mi = self.v_min.get()
+                s = self.v_sec.get()
+                dt_str = f"{y:04d}-{m:02d}-{d:02d} {h:02d}:{mi:02d}:{s:02d}"
+            except Exception as ex:
+                messagebox.showerror("入力エラー", f"日時の入力値が不正です:\n{ex}", parent=self)
+                return
+
+            if sys.platform.startswith("win"):
+                messagebox.showinfo(
+                    "日時設定 (Windows)",
+                    f"Windows環境のため実際のシステム時刻変更はスキップされました。\n設定指定値: {dt_str}\n(Linux/ラズパイ環境で自動設定コマンドが実行されます)",
+                    parent=self
+                )
+                self.destroy()
+                return
+
+            import subprocess
+            cmds = [
+                ["sudo", "timedatectl", "set-ntp", "false"],
+                ["sudo", "timedatectl", "set-time", dt_str],
+                ["sudo", "date", "-s", dt_str],
+                ["sudo", "hwclock", "-w"]
+            ]
+            results = []
+            success_count = 0
+            for cmd in cmds:
+                try:
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    if res.returncode == 0:
+                        success_count += 1
+                        results.append(f"成功: {' '.join(cmd)}")
+                    else:
+                        err = res.stderr.strip() or res.stdout.strip()
+                        results.append(f"失敗 ({' '.join(cmd)}): {err}")
+                except Exception as ex:
+                    results.append(f"エラー ({' '.join(cmd)}): {ex}")
+
+            msg = f"日時を [{dt_str}] に設定しました。\n\n【実行詳細】\n" + "\n".join(results)
+            if success_count > 0:
+                messagebox.showinfo("日時設定完了", msg, parent=self)
+                self.destroy()
+            else:
+                messagebox.showerror("日時設定失敗", msg, parent=self)
+
+        btn_save = tk.Button(
+            f_btns, text="日時を本体に反映", font=(FONT_FAMILY, 11, "bold"),
+            bg=COLOR_ACCENT, fg="white", relief="flat", padx=20, pady=8,
+            cursor="hand2", command=_apply
+        )
+        btn_save.pack(side=tk.RIGHT, padx=(10, 0))
+
+        btn_cancel = tk.Button(
+            f_btns, text="キャンセル", font=(FONT_FAMILY, 11, "bold"),
+            bg=COLOR_BG_INPUT, fg=COLOR_TEXT_MAIN, relief="flat", padx=18, pady=8,
+            cursor="hand2", command=self.destroy
+        )
+        btn_cancel.pack(side=tk.RIGHT)
+
+        # ヘッダータイトル & 説明
+        tk.Label(
+            self, text="ラズパイ本体の日時設定", font=FONT_LARGE,
+            bg=COLOR_BG_MAIN, fg=COLOR_ACCENT
+        ).pack(pady=(20, 6))
+
+        tk.Label(
+            self, text="本体のシステム日付・時刻を設定します。\n(Linux / Raspberry Pi 環境で timedatectl / date が更新されます)",
+            font=FONT_SET_VAL, bg=COLOR_BG_MAIN, fg=COLOR_TEXT_SUB, justify="center",
+            wraplength=500
+        ).pack(pady=(0, 16), padx=20)
+
+        # 入力フレーム
+        f_dt = tk.Frame(self, bg=COLOR_BG_PANEL, padx=20, pady=20)
+        f_dt.pack(padx=24, fill=tk.X, expand=True)
+
+        font_num = (FONT_FAMILY, 14, "bold")
+        font_lbl = (FONT_FAMILY, 12, "bold")
+
+        # 年月日
+        f_date = tk.Frame(f_dt, bg=COLOR_BG_PANEL)
+        f_date.pack(fill=tk.X, pady=8)
+        
+        self.v_year = tk.IntVar(value=now.year)
+        self.v_month = tk.IntVar(value=now.month)
+        self.v_day = tk.IntVar(value=now.day)
+
+        tk.Label(f_date, text="日付:", font=font_lbl, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN, width=6, anchor="w").pack(side=tk.LEFT)
+        sp_y = ttk.Spinbox(f_date, from_=2020, to=2099, increment=1, textvariable=self.v_year, width=6, font=font_num)
+        sp_y.pack(side=tk.LEFT, padx=4)
+        tk.Label(f_date, text="年", font=font_lbl, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(0, 10))
+
+        sp_m = ttk.Spinbox(f_date, from_=1, to=12, increment=1, textvariable=self.v_month, width=4, font=font_num)
+        sp_m.pack(side=tk.LEFT, padx=4)
+        tk.Label(f_date, text="月", font=font_lbl, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(0, 10))
+
+        sp_d = ttk.Spinbox(f_date, from_=1, to=31, increment=1, textvariable=self.v_day, width=4, font=font_num)
+        sp_d.pack(side=tk.LEFT, padx=4)
+        tk.Label(f_date, text="日", font=font_lbl, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT)
+
+        # 時分秒
+        f_time = tk.Frame(f_dt, bg=COLOR_BG_PANEL)
+        f_time.pack(fill=tk.X, pady=8)
+
+        self.v_hour = tk.IntVar(value=now.hour)
+        self.v_min = tk.IntVar(value=now.minute)
+        self.v_sec = tk.IntVar(value=now.second)
+
+        tk.Label(f_time, text="時刻:", font=font_lbl, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN, width=6, anchor="w").pack(side=tk.LEFT)
+        sp_h = ttk.Spinbox(f_time, from_=0, to=23, increment=1, textvariable=self.v_hour, width=4, font=font_num)
+        sp_h.pack(side=tk.LEFT, padx=4)
+        tk.Label(f_time, text="時", font=font_lbl, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(0, 10))
+
+        sp_mi = ttk.Spinbox(f_time, from_=0, to=59, increment=1, textvariable=self.v_min, width=4, font=font_num)
+        sp_mi.pack(side=tk.LEFT, padx=4)
+        tk.Label(f_time, text="分", font=font_lbl, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(0, 10))
+
+        sp_s = ttk.Spinbox(f_time, from_=0, to=59, increment=1, textvariable=self.v_sec, width=4, font=font_num)
+        sp_s.pack(side=tk.LEFT, padx=4)
+        tk.Label(f_time, text="秒", font=font_lbl, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT)
+
+        def _set_current():
+            n = datetime.now()
+            self.v_year.set(n.year)
+            self.v_month.set(n.month)
+            self.v_day.set(n.day)
+            self.v_hour.set(n.hour)
+            self.v_min.set(n.minute)
+            self.v_sec.set(n.second)
+
+        btn_now = tk.Button(
+            f_dt, text="現在端末の時刻をセット", font=(FONT_FAMILY, 11, "bold"),
+            bg=COLOR_BG_INPUT, fg=COLOR_ACCENT, relief="flat", padx=16, pady=6,
+            cursor="hand2", command=_set_current
+        )
+        btn_now.pack(pady=(14, 4))
+
+
 class GPIOTestDialog(tk.Toplevel):
     def __init__(self, parent, gpio_settings):
         super().__init__(parent)
@@ -299,8 +465,8 @@ class SettingsDialog(tk.Toplevel):
                             "・パターン判定ピン: どの検査パターンを使うかをピンのON/OFFで決めます。\n"
                             "・出力(OK/NG): 判定結果を外部装置（PLC等）へ送る出力ピンです。\n"
                             "・40Pin Map: Raspberry Piの配線図を参照できます。クリックでBCM番号を入力できます。",
-            "3. パターン設定": "【概要】PatchCore(異常検知)モデルの設定を行います。\n"
-                           "・各カメラ行ごとに、学習済みのモデルファイル（`.ckpt`）を割り当てます。未指定のカメラは自動的に検査SKIP（評価対象外）となります。\n"
+            "3. パターン設定": "【概要】PatchCore / PaDiM (異常検知)モデルの設定を行います。\n"
+                           "・各カメラ行ごとに、学習済みのモデルファイル（`.ckpt`）を割り当てます。PatchCore および PaDiM の両モデルに対応しています。未指定のカメラは自動的に検査SKIP（評価対象外）となります。\n"
                            "・「判定しきい値」にはそのモデルで使用する異常判定しきい値を設定します (通常 0.40〜0.50 程度)。\n"
                            "・「テスト」ボタンを押すことで、その設定値を用いて指定したカメラでリアルタイムヒートマップ判定テストを行うことができます。\n",
             "4. 保存・画素数設定": "【概要】画像の質や保存先、保存ルールを決めます。\n"
@@ -1450,7 +1616,7 @@ class SettingsDialog(tk.Toplevel):
         v_ng_t = tk.StringVar(value=str(s.get("ng_output_time", "")))
         ng_sp = self._spinbox(r_ng, v_ng_t, 0.0, 60.0, 0.1, width=8)
         ng_sp.pack(side=tk.LEFT)
-        _unit(r_ng, "sec（空欄=ブザー停止まで保持）")
+        _unit(r_ng, "秒（空欄時は停止ボタンまで保持）")
         def _upd_ng_t(*a):
             val = v_ng_t.get().strip()
             try: s["ng_output_time"] = float(val) if val else ""
@@ -1566,7 +1732,7 @@ class SettingsDialog(tk.Toplevel):
         r_step = _row_frame(g6)
         v_step = tk.BooleanVar(value=bool(st_sys.get("commit_half_step", False)))
         cb_step = tk.Checkbutton(
-            r_step, text="コミット番号を0.5刻みで進める (ドアライン対応)",
+            r_step, text="コミット番号を0.5刻みで進める",
             variable=v_step, onvalue=True, offvalue=False,
             font=FONT_SET_VAL, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN,
             activebackground=COLOR_BG_PANEL, activeforeground=COLOR_TEXT_MAIN,
@@ -1637,80 +1803,175 @@ class SettingsDialog(tk.Toplevel):
 
         v_delay.trace_add("write", _upd_delay)
 
-        # グループ7: 起動ショートカット作成
-        g7 = _make_group(scroll_f, "起動ショートカット作成")
-        r_sc = _row_frame(g7)
-        _lbl(r_sc, "デスクトップ起動スクリプト:", "デスクトップにワンクリックで起動できる .bat / .sh ファイルを作成します。")
+        # =====================================================================
+        # 5. システムツール & メンテナンス
+        # =====================================================================
+        g5 = _make_group(scroll_f, "システムツール & メンテナンス", pady=(10, 16))
 
-        def _create_desktop_shortcuts():
-            import sys
+        # 起動ショートカット作成
+        r_sh = _row_frame(g5)
+        _lbl(r_sh, "起動スクリプト生成:", "デスクトップにワンクリックで本アプリを起動するファイルを作成します。")
+
+        def _get_desktop_path():
+            home = os.path.expanduser("~")
+            if sys.platform.startswith("win"):
+                desktop = os.path.join(home, "Desktop")
+                if os.path.exists(desktop): return desktop
+                try:
+                    import winreg
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders")
+                    path, _ = winreg.QueryValueEx(key, "Desktop")
+                    winreg.CloseKey(key)
+                    expanded = os.path.expandvars(path)
+                    if os.path.exists(expanded): return expanded
+                except Exception: pass
+                return desktop
+            else:
+                desktop = os.path.join(home, "Desktop")
+                if os.path.exists(desktop): return desktop
+                desktop_ja = os.path.join(home, "デスクトップ")
+                if os.path.exists(desktop_ja): return desktop_ja
+                return desktop
+
+        def _create_desktop_launcher():
             try:
-                # デスクトップフォルダの取得
-                home = os.path.expanduser("~")
-                desktop_candidates = [
-                    os.path.join(home, "Desktop"),
-                    os.path.join(home, "OneDrive", "Desktop"),
-                    os.path.join(home, "OneDrive", "デスクトップ"),
-                    os.path.join(home, "デスクトップ"),
-                ]
-                desktop_dir = None
-                for d in desktop_candidates:
-                    if os.path.exists(d):
-                        desktop_dir = d
-                        break
-                if not desktop_dir:
-                    desktop_dir = os.path.join(home, "Desktop")
+                desktop_dir = _get_desktop_path()
+                if not os.path.exists(desktop_dir):
                     os.makedirs(desktop_dir, exist_ok=True)
 
-                # プロジェクトルートディレクトリ & Python実行ファイルのパス
                 app_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
                 python_exe = sys.executable
 
-                created_files = []
-
-                if sys.platform == "win32":
-                    # Windows用 .bat 作成
-                    bat_path = os.path.join(desktop_dir, "AI自動検査システム起動.bat")
-                    bat_content = (
-                        f"@echo off\n"
-                        f"chcp 65001 > nul\n"
-                        f"title AI自動検査システム (PatchCore)\n"
+                is_win = sys.platform.startswith("win")
+                if is_win:
+                    filename = "AI自動検査システム起動.bat"
+                    file_path = os.path.join(desktop_dir, filename)
+                    content = (
+                        "@echo off\n"
+                        "chcp 65001 > nul\n"
+                        "title AI自動検査システム (PatchCore/PaDiM)\n"
                         f'cd /d "{app_dir}"\n'
-                        f'"{python_exe}" "main.py"\n'
-                        f"if errorlevel 1 pause\n"
+                        f'"{python_exe}" main.py\n'
+                        "if %errorlevel% neq 0 (\n"
+                        "    echo.\n"
+                        "    echo エラーが発生しました。キーを押すと終了します...\n"
+                        "    pause > nul\n"
+                        ")\n"
                     )
-                    with open(bat_path, "w", encoding="utf-8") as f:
-                        f.write(bat_content)
-                    created_files.append(bat_path)
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(content)
                 else:
-                    # Linux / macOS 用 .sh 作成
-                    sh_path = os.path.join(desktop_dir, "start_inspection_app.sh")
-                    sh_content = (
-                        f"#!/bin/bash\n"
+                    filename = "start_inspection_app.sh"
+                    file_path = os.path.join(desktop_dir, filename)
+                    content = (
+                        "#!/bin/bash\n"
                         f'cd "{app_dir}"\n'
-                        f'"{python_exe}" "main.py"\n'
+                        f'"{python_exe}" main.py\n'
+                        "if [ $? -ne 0 ]; then\n"
+                        '    read -p "エラーが発生しました。Enterキーを押すと終了します..."\n'
+                        "fi\n"
                     )
-                    with open(sh_path, "w", encoding="utf-8", newline="\n") as f:
-                        f.write(sh_content)
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(content)
                     try:
-                        os.chmod(sh_path, 0o755)
+                        os.chmod(file_path, 0o755)
                     except Exception:
                         pass
-                    created_files.append(sh_path)
 
-                msg = "デスクトップに起動スクリプトを作成しました：\n\n" + "\n".join(created_files)
-                messagebox.showinfo("ショートカット作成成功", msg, parent=self)
+                messagebox.showinfo("ショートカット作成完了", f"デスクトップに起動スクリプトを作成しました:\n\n{file_path}", parent=self)
             except Exception as ex:
                 messagebox.showerror("作成失敗", f"起動スクリプトの作成中にエラーが発生しました:\n{ex}", parent=self)
 
-        btn_sc = tk.Button(
-            r_sc, text="デスクトップに起動スクリプトを作成", font=FONT_NORMAL,
-            bg=COLOR_ACCENT, fg="#ffffff",
+        is_win = sys.platform.startswith("win")
+        btn_text = "デスクトップに起動ファイルを作成 (.bat)" if is_win else "デスクトップに起動ファイルを作成 (.sh)"
+
+        btn_shortcut = tk.Button(
+            r_sh, text=btn_text, font=FONT_NORMAL,
+            bg=COLOR_ACCENT, fg="white",
             relief="flat", padx=10, pady=4, cursor="hand2",
-            command=_create_desktop_shortcuts
+            command=_create_desktop_launcher
         )
-        btn_sc.pack(side=tk.LEFT, padx=(4, 0))
-        Tooltip(btn_sc, "デスクトップ上に本システムを起動する .bat および .sh ファイルを自動生成します。")
+        btn_shortcut.pack(side=tk.LEFT, padx=(0, 6))
+        Tooltip(btn_shortcut, f"デスクトップに本アプリを起動する{'batch (.bat)' if is_win else 'shell (.sh)'}ファイルを作成します")
+
+        # 日時設定
+        r_datetime = _row_frame(g5)
+        _lbl(r_datetime, "ラズパイ本体日時設定:", "本体のシステム日付・時刻を手動設定または端末同期します。")
+
+        def _open_datetime_dialog():
+            SystemDateTimeDialog(self)
+
+        btn_dt = tk.Button(
+            r_datetime, text="ラズパイ本体の日時を設定", font=FONT_NORMAL,
+            bg=COLOR_ACCENT, fg="white",
+            relief="flat", padx=10, pady=4, cursor="hand2",
+            command=_open_datetime_dialog
+        )
+        btn_dt.pack(side=tk.LEFT, padx=(0, 6))
+        Tooltip(btn_dt, "Linux/Raspberry Piのシステム日時(timedatectl/date)を設定するダイアログを開きます")
+
+        # USBスピーカー設定
+        r_audio = _row_frame(g5)
+        _lbl(r_audio, "USBスピーカー自動設定:", "音が出ない場合に、ALSA/PulseAudio/PipeWire等の出力先とミュートを自動解除します。")
+
+        def _fix_usb_audio():
+            if sys.platform.startswith("win"):
+                messagebox.showinfo(
+                    "USBスピーカー設定 (Windows)",
+                    "Windows環境のためLinuxオーディオ設定 (ALSA/PulseAudio/PipeWire/asoundrc) はスキップされました。\n"
+                    "※ラズパイ/Linux環境で自動出力設定が実行されます。",
+                    parent=self
+                )
+                return
+
+            import subprocess
+            logs = []
+
+            # 1. ALSA mixer (amixer) ミュート解除・ボリューム100%化
+            channels = ["Master", "PCM", "Speaker", "Headphone", "Line"]
+            for card_idx in range(5):
+                for ch in channels:
+                    cmd = ["amixer", "-c", str(card_idx), "sset", ch, "100%", "unmute"]
+                    try:
+                        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+                        if r.returncode == 0: logs.append(f"ALSA: card {card_idx} {ch} -> 100% unmute")
+                    except Exception: pass
+
+            for ch in channels:
+                try: subprocess.run(["amixer", "sset", ch, "100%", "unmute"], capture_output=True, text=True, timeout=3)
+                except Exception: pass
+
+            try:
+                subprocess.run(["sudo", "alsactl", "store"], capture_output=True, text=True, timeout=3)
+                logs.append("ALSA: alsactl store 実行完了")
+            except Exception: pass
+
+            # 2. PulseAudio / PipeWire (pactl / wpctl)
+            try:
+                subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"], capture_output=True, text=True, timeout=3)
+                subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "100%"], capture_output=True, text=True, timeout=3)
+                logs.append("PulseAudio: @DEFAULT_SINK@ -> unmute & 100%")
+            except Exception: pass
+
+            # 3. Pygame Mixer 再初期化
+            try:
+                import pygame
+                pygame.mixer.quit()
+                pygame.mixer.init()
+                logs.append("Pygame: Audio Mixer 再初期化完了")
+            except Exception: pass
+
+            msg = "USBスピーカー自動出力設定を実行しました。\n\n【詳細ログ】\n" + ("\n".join(logs) if logs else "設定を実行しました。")
+            messagebox.showinfo("USBスピーカー設定完了", msg, parent=self)
+
+        btn_audio = tk.Button(
+            r_audio, text="USBスピーカー音声出力を自動復旧・設定", font=FONT_NORMAL,
+            bg=COLOR_ACCENT, fg="white",
+            relief="flat", padx=10, pady=4, cursor="hand2",
+            command=_fix_usb_audio
+        )
+        btn_audio.pack(side=tk.LEFT, padx=(0, 6))
+        Tooltip(btn_audio, "音が出ない場合に、USBスピーカーを優先出力先に変更しミュート解除・音量最大化を行います")
 
     # ---- 保存 / GPIO テスト ----
 

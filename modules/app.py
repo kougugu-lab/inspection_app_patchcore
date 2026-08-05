@@ -216,18 +216,40 @@ class InspectionSystem:
             return self.patchcore_models[model_path]
 
         try:
-            self.logger.info(f"PatchCoreモデルをロード中: {model_path}")
-            from anomalib.models import Patchcore
+            self.logger.info(f"AIモデル(PatchCore/PaDiM)をロード中: {model_path}")
+            from anomalib.models import Patchcore, Padim
             device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            # 設定 JSON が存在すれば model_type を確認
+            model_type = "patchcore"
+            json_path = path_obj.parent / "optimal_settings.json"
+            if json_path.exists():
+                try:
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                        model_type = cfg.get("model_type", "patchcore").lower()
+                except Exception:
+                    pass
+
             with self.model_lock:
-                model = Patchcore.load_from_checkpoint(model_path)
+                if "padim" in model_type or "padim" in path_obj.name.lower():
+                    try:
+                        model = Padim.load_from_checkpoint(model_path)
+                    except Exception:
+                        model = Patchcore.load_from_checkpoint(model_path)
+                else:
+                    try:
+                        model = Patchcore.load_from_checkpoint(model_path)
+                    except Exception:
+                        model = Padim.load_from_checkpoint(model_path)
+
                 model = model.to(device)
                 model.eval()
             self.patchcore_models[model_path] = model
-            self.logger.info(f"PatchCoreモデルのロード完了 ({device}): {model_path}")
+            self.logger.info(f"AIモデルのロード完了 ({device}): {model_path}")
             return model
         except Exception as e:
-            self.logger.error(f"PatchCoreモデルのロードに失敗しました: {model_path} - {e}")
+            self.logger.error(f"AIモデルのロードに失敗しました: {model_path} - {e}")
             return None
 
     def predict_patchcore(self, model, cv_img):
@@ -465,7 +487,7 @@ class InspectionSystem:
 
     def setup_gui(self):
         self.root = tk.Tk()
-        self.root.title(f"AI自動検査システム (PatchCore異常検知版) {VERSION}")
+        self.root.title(f"AI自動検査システム (PatchCore / PaDiM 異常検知版) {VERSION}")
         self.root.geometry("1400x900")
         self.root.configure(bg=COLOR_BG_MAIN)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -968,12 +990,12 @@ class InspectionSystem:
 
     def show_main_help(self):
         help_data = {
-            "概要": "AI (PatchCore異常検知) を用いた、正常・異常判定システムです。\n\n【基本的な流れ】\n1. 設定画面でカメラや判定条件（モデル、しきい値）を登録する。\n2. コミット番号を設定する。\n3. トリガー待ち状態になります。設定された順序（上から順）に外部信号が入ると撮影・判定が行われます。",
+            "概要": "AI (PatchCore / PaDiM 異常検知) を用いた、正常・異常判定システムです。\n\n【基本的な流れ】\n1. 設定画面でカメラや判定条件（モデル、しきい値）を登録する。\n2. コミット番号を設定する。\n3. トリガー待ち状態になります。設定された順序（上から順）に外部信号が入ると撮影・判定が行われます。",
             "検査モード": "自動判定を行う通常モードです。\n・トリガーが順に入ると判定が開始されます。\n・画像のアノマリスコアがモデルごとの「しきい値」未満ならOK（正常）、以上ならNG（異常）信号を出力します。\n・NG時はヒートマップ付きの画像と元画像（NG_RAW）を自動保存します。",
-            "撮影モード": "判定を行わず、画像を収集するモードです。\n・リトライ回数分の画像を全て保存し、学習用（AnomalibでのPatchCore学習）データの収集に使用します。",
+            "撮影モード": "判定を行わず、画像を収集するモードです。\n・リトライ回数分の画像を全て保存し、学習用（PatchCore / PaDiM モデル作成アプリ等）データの収集に使用します。",
             "コミット番号": "ファイル名やログに含まれる管理番号です。\n・1サイクル（全トリガー完了）ごとに自動で+1されます。\n・「番号入力」から手動設定も可能です。\n・ドアライン対応: 設定画面で「0.5刻み」を有効にすると、コミット番号が0.5刻みで進みます。",
             "NG履歴とお知らせ": "最近のNG（異常検出）判定が簡易表示されます。\n・ダブルクリックで画像を確認できます。\n・ステータスバーには現在の「撮影中」「検査中」などの状態が表示されます。",
-            "PatchCore設定": "設定画面の「パターン」タブで設定します。\n・カメラごと、トリガーごと個別に `.ckpt` モデルファイルを指定できます。\n・「判定しきい値」: この値以上にアノマリスコアが高くなると、異常（Abnormal/NG）とみなします。\n・「テストボタン」: 現在のカメラライブ映像に、指定したモデルでのリアルタイムの異常度ヒートマップを重ね合わせて合否プレビューできます。"
+            "AIモデル・パターン設定": "設定画面の「パターン」タブで設定します。\n・カメラごと、トリガーごと個別に PatchCore または PaDiM の `.ckpt` モデルファイルを指定できます。\n・「判定しきい値」: この値以上にアノマリスコアが高くなると、異常（Abnormal/NG）とみなします。\n・「テストボタン」: 現在のカメラライブ映像に、指定したモデルでのリアルタイムの異常度ヒートマップを重ね合わせて合否プレビューできます。"
         }
         HelpWindow(self.root, "操作ヘルプ", help_data)
 
