@@ -41,6 +41,99 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 
+def detect_available_cameras():
+    """OSが認識しているカメラデバイスを高速探索し、
+    [(index_int, display_label_str), ...] のリストを返す
+    """
+    import sys
+    import subprocess
+    import cv2
+    import os
+
+    # OpenCV のキャプチャ失敗警告ログを消音
+    try:
+        if hasattr(cv2, "utils") and hasattr(cv2.utils, "logging"):
+            cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
+    except Exception:
+        pass
+
+    devices = []
+
+    if sys.platform.startswith("linux"):
+        # Linux (Raspberry Pi 等): /sys/class/video4linux/video*/name を軽量チェック
+        v4l_dir = "/sys/class/video4linux"
+        if os.path.exists(v4l_dir):
+            ignore_keywords = [
+                "codec", "rpivid", "vc4", "media-controller", "bcm2835-isp",
+                "bcm2835-codec", "h264", "hevc", "vp8", "isp", "decoder", "encoder", "unicam-isp"
+            ]
+            for entry in sorted(os.listdir(v4l_dir), key=lambda x: int(x.replace("video", "")) if x.replace("video", "").isdigit() else 999):
+                if entry.startswith("video"):
+                    try:
+                        idx = int(entry.replace("video", ""))
+                        name_file = os.path.join(v4l_dir, entry, "name")
+                        cam_name = f"カメラ {idx}"
+                        if os.path.exists(name_file):
+                            with open(name_file, "r", encoding="utf-8", errors="ignore") as f:
+                                name_text = f.read().strip()
+                                if name_text:
+                                    cam_name = name_text
+                        
+                        # 非カメラ（bcm2835-codec, bcm2835-isp などのデコーダ/エンコーダ/ISPノード）を即座に除外
+                        if any(k in cam_name.lower() for k in ignore_keywords):
+                            continue
+
+                        # 実際のカメラノードのみ簡易キャプチャ確認 (CAP_V4L2)
+                        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+                        if cap and cap.isOpened():
+                            ret, _ = cap.read()
+                            if ret:
+                                devices.append((idx, f"[{idx}] {cam_name}"))
+                            cap.release()
+                    except Exception:
+                        pass
+    elif sys.platform.startswith("win"):
+        # Windows: PowerShell で PnP カメラデバイス名を取得
+        names_from_ps = []
+        try:
+            ps_cmd = 'Get-CimInstance Win32_PnPEntity | Where-Object {$_.PNPClass -eq "Camera" -or $_.PNPClass -eq "Image"} | Select-Object -ExpandProperty Name'
+            res = subprocess.run(["powershell", "-Command", ps_cmd], capture_output=True, text=True, timeout=2)
+            if res.returncode == 0 and res.stdout:
+                names_from_ps = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        except Exception:
+            pass
+
+        open_indices = []
+        for idx in range(6):  # 高速化のため最大 6 デバイス探索
+            try:
+                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(idx, cv2.CAP_ANY)
+                if cap and cap.isOpened():
+                    ret, _ = cap.read()
+                    if ret:
+                        open_indices.append(idx)
+                    cap.release()
+            except Exception:
+                pass
+
+        for i, idx in enumerate(open_indices):
+            if i < len(names_from_ps):
+                d_name = names_from_ps[i]
+            else:
+                d_name = f"USB Camera {idx}"
+            devices.append((idx, f"[{idx}] {d_name}"))
+
+    # 万が一なにも取れなかった場合、あるいは標準的なインデックス 0～3 を補完
+    existing_indices = {d[0] for d in devices}
+    for idx in range(4):
+        if idx not in existing_indices:
+            devices.append((idx, f"[{idx}] カメラ (インデックス {idx})"))
+
+    devices.sort(key=lambda x: x[0])
+    return devices
+
+
 # ---------------------------------------------------------------------------
 # システム日時設定ダイアログ
 # ---------------------------------------------------------------------------
@@ -542,14 +635,33 @@ class SettingsDialog(tk.Toplevel):
                   bg="#546E7A", fg="white", relief="flat",
                   command=self.scan_cameras)
         btn_scan.pack(side=tk.LEFT, padx=(10, 0))
-        Tooltip(btn_scan, "インデックス 0～9 を順に確認し、映像が取れたカメラを自動で一覧表示します")
+        Tooltip(btn_scan, "OSが認識しているカメラデバイスをスキャンし、利用可能なカメラ名とインデックスを取得します")
         tk.Label(f_bottom, textvariable=self._scan_status_var, font=FONT_NORMAL,
                  bg=COLOR_BG_PANEL, fg=COLOR_WARNING).pack(side=tk.LEFT, padx=15)
+        
+        # 最初は即座にUIを構築（フリーズ防止）
+        self.available_cams = [(c.get("index", 0), c.get("device_name", f"[{c.get('index', 0)}] カメラ")) for c in self.temp_data.get("cameras", [])]
+        if not self.available_cams:
+            self.available_cams = [(idx, f"[{idx}] カメラ (インデックス {idx})") for idx in range(4)]
         self.refresh_cam()
+
+        # バックグラウンドスレッドで非同期にカメラデバイスを探索
+        def _async_init_scan():
+            cams = detect_available_cameras()
+            def _apply():
+                if self.winfo_exists():
+                    self.available_cams = cams
+                    self.refresh_cam()
+            self.after(0, _apply)
+
+        threading.Thread(target=_async_init_scan, daemon=True).start()
 
     def refresh_cam(self):
         for w in self.cam_body.winfo_children():
             w.destroy()
+
+        cam_labels = [label for _, label in self.available_cams]
+
         for i, c in enumerate(self.temp_data["cameras"]):
             def _create_cam_row(idx=i, cam_obj=c):
                 f = tk.LabelFrame(self.cam_body, text=f"カメラ {idx+1}",
@@ -560,28 +672,53 @@ class SettingsDialog(tk.Toplevel):
                 l_name = tk.Label(f, text="表示名:", font=FONT_SET_VAL, bg=COLOR_BG_PANEL,
                          fg=COLOR_TEXT_MAIN)
                 l_name.grid(row=0, column=0)
-                Tooltip(l_name, "カメラの表示名です。")
+                Tooltip(l_name, "カメラの識別表示名です。")
                 vn = tk.StringVar(value=cam_obj["name"])
                 e_name = self._entry(f, vn, key_path=f"cameras.{idx}.name")
                 e_name.grid(row=0, column=1, padx=10)
 
-                l_idx = tk.Label(f, text="インデックス:", font=FONT_SET_VAL, bg=COLOR_BG_PANEL,
+                l_idx = tk.Label(f, text="カメラデバイス:", font=FONT_SET_VAL, bg=COLOR_BG_PANEL,
                          fg=COLOR_TEXT_MAIN)
                 l_idx.grid(row=0, column=2)
-                Tooltip(l_idx, "認識しているカメラ番号です（通常は 0, 2, 4...）。")
-                vi = tk.StringVar(value=str(cam_obj.get("index", 0)))
-                sb_idx = self._spinbox(f, vi, 0, 99, 1, width=5, key_path=f"cameras.{idx}.index")
-                sb_idx.grid(row=0, column=3, padx=10)
+                Tooltip(l_idx, "接続されているカメラデバイスを選択します。")
+                
+                curr_idx = cam_obj.get("index", 0)
+                # 初期選択ラベルの探索
+                init_val = f"[{curr_idx}] カメラ"
+                for c_int, c_label in self.available_cams:
+                    if c_int == curr_idx:
+                        init_val = c_label
+                        break
 
-                def _upd_inner(v_n=vn, v_i=vi):
-                    try:
-                        val = int(v_i.get())
-                    except ValueError:
-                        val = 0
-                    self.temp_data["cameras"][idx].update({"name": v_n.get(), "index": val})
+                combo_var = tk.StringVar(value=init_val)
+                cb_dev = ttk.Combobox(f, textvariable=combo_var, values=cam_labels,
+                                      font=FONT_SET_VAL, state="normal", width=28)
+                cb_dev.grid(row=0, column=3, padx=10)
 
-                vn.trace_add("write", lambda *a: _upd_inner())
-                vi.trace_add("write", lambda *a: _upd_inner())
+                def _upd_inner(*args, v_n=vn, v_c=combo_var):
+                    sel_text = v_c.get()
+                    # 選ばれたテキストからインデックス数値を判定 (例: "[0] Integrated Camera" -> 0)
+                    val = 0
+                    if sel_text.startswith("[") and "]" in sel_text:
+                        try:
+                            val = int(sel_text.split("]")[0].replace("[", ""))
+                        except ValueError:
+                            val = 0
+                    else:
+                        try:
+                            val = int(sel_text)
+                        except ValueError:
+                            val = 0
+                    self.temp_data["cameras"][idx].update({
+                        "name": v_n.get(),
+                        "index": val,
+                        "device_name": sel_text
+                    })
+                    self._mark_changed()
+
+                vn.trace_add("write", _upd_inner)
+                combo_var.trace_add("write", _upd_inner)
+                cb_dev.bind("<<ComboboxSelected>>", _upd_inner)
 
                 if len(self.temp_data["cameras"]) > 1:
                     tk.Button(f, text="削除", font=FONT_BTN_LARGE, bg=COLOR_NG_MUTED,
@@ -599,10 +736,11 @@ class SettingsDialog(tk.Toplevel):
         try:
             c_idx = int(c_idx_str)
         except ValueError:
-            messagebox.showerror("エラー", "正しいカメラインデックスを入力してください。")
+            messagebox.showerror("エラー", "正しいカメラインデックスを選択してください。")
             return
+        dev_name = self.temp_data["cameras"][idx].get("device_name", f"インデックス: {c_idx}")
         test_win = tk.Toplevel(self)
-        test_win.title(f"カメラテスト (インデックス: {c_idx})")
+        test_win.title(f"カメラテスト ({dev_name})")
         test_win.geometry("640x480")
         test_win.transient(self)
         test_win.grab_set()
@@ -612,7 +750,7 @@ class SettingsDialog(tk.Toplevel):
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not cap.isOpened():
-            messagebox.showerror("エラー", f"カメラ (インデックス: {c_idx}) を開けませんでした。")
+            messagebox.showerror("エラー", f"カメラ ({dev_name}) を開けませんでした。")
             test_win.destroy()
             return
 
@@ -637,10 +775,17 @@ class SettingsDialog(tk.Toplevel):
     def add_cam(self):
         if len(self.temp_data["cameras"]) < 4:
             next_num = len(self.temp_data["cameras"]) + 1
+            default_idx = 0
+            if self.available_cams:
+                used_indices = {c.get("index") for c in self.temp_data["cameras"]}
+                for c_int, _ in self.available_cams:
+                    if c_int not in used_indices:
+                        default_idx = c_int
+                        break
             self.temp_data["cameras"].append({
                 "id": f"cam_{int(time.time())}",
                 "name": f"カメラ {next_num}",
-                "index": 0
+                "index": default_idx
             })
             self.refresh_cam()
             self._mark_changed()
@@ -651,59 +796,51 @@ class SettingsDialog(tk.Toplevel):
         self._mark_changed()
 
     def scan_cameras(self):
-        import sys
         self._scan_status_var.set("スキャン中...")
 
         def _do_scan():
-            found = []
-            backend = cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY
-            for idx in range(10):
-                try:
-                    cap = cv2.VideoCapture(idx, backend)
-                    if cap and cap.isOpened():
-                        ret, _ = cap.read()
-                        if ret:
-                            found.append(idx)
-                    cap.release()
-                except Exception:
-                    pass
-            self.after(0, lambda: _on_found(found))
+            cams = detect_available_cameras()
+            self.after(0, lambda: _on_found(cams))
 
-        def _on_found(found):
+        def _on_found(cams):
             if not self.winfo_exists():
                 return
-            self._scan_status_var.set(f"検出: {found if found else 'なし'}")
-            if not found:
+            self.available_cams = cams
+            self._scan_status_var.set(f"検出: {len(cams)}台")
+            if not cams:
+                messagebox.showinfo("カメラ検出", "利用可能なカメラが検出されませんでした。")
+                self.refresh_cam()
                 return
             win = tk.Toplevel(self)
-            win.title("検出されたカメラ")
-            win.geometry("460x320")
+            win.title("検出されたカメラ一覧")
+            win.geometry("480x360")
             win.configure(bg=COLOR_BG_MAIN)
             win.transient(self)
             win.grab_set()
-            tk.Label(win, text="以下のカメラが検出されました。追加するものを選択してください:",
+            tk.Label(win, text="検出された以下のカメラを選択して一括追加できます:",
                      font=FONT_NORMAL, bg=COLOR_BG_MAIN, fg=COLOR_TEXT_MAIN,
                      wraplength=440).pack(pady=(15, 5), padx=15)
             vars_list = []
-            for cidx in found:
+            for cidx, clabel in cams:
                 v = tk.BooleanVar(value=True)
-                cb = tk.Checkbutton(win, text=f"インデックス {cidx}", font=FONT_SET_VAL,
+                cb = tk.Checkbutton(win, text=clabel, font=FONT_SET_VAL,
                                     variable=v, bg=COLOR_BG_MAIN, fg=COLOR_TEXT_MAIN,
                                     selectcolor=COLOR_BG_INPUT, activebackground=COLOR_BG_MAIN,
                                     relief="flat")
                 cb.pack(anchor="w", padx=30, pady=4)
-                vars_list.append((cidx, v))
+                vars_list.append((cidx, clabel, v))
 
             def _apply():
                 current_indices = {c.get("index") for c in self.temp_data["cameras"]}
-                for cidx, v in vars_list:
+                for cidx, clabel, v in vars_list:
                     if v.get() and cidx not in current_indices:
                         if len(self.temp_data["cameras"]) < 4:
                             next_n = len(self.temp_data["cameras"]) + 1
                             self.temp_data["cameras"].append({
                                 "id": f"cam_{int(time.time())}_{cidx}",
                                 "name": f"カメラ {next_n}",
-                                "index": cidx
+                                "index": cidx,
+                                "device_name": clabel
                             })
                 self.refresh_cam()
                 win.destroy()
