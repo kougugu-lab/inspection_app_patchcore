@@ -16,32 +16,38 @@ from .constants import (
 
 
 def get_tenkey_keys(is_half_step=False):
-    """テンキーの配置を返す。小数点ボタンは常に .5 を使用する。"""
-    return [('7', 0, 0), ('8', 0, 1), ('9', 0, 2),
-            ('4', 1, 0), ('5', 1, 1), ('6', 1, 2),
-            ('1', 2, 0), ('2', 2, 1), ('3', 2, 2),
-            ('0', 3, 0), ('.5', 3, 1), ('BS', 3, 2)]
+    """テンキーの配置を返す。0.5刻みモード時のみ Fr/Rr 切替キーを配置、OFF時は非表示。"""
+    if is_half_step:
+        return [('7', 0, 0), ('8', 0, 1), ('9', 0, 2),
+                ('4', 1, 0), ('5', 1, 1), ('6', 1, 2),
+                ('1', 2, 0), ('2', 2, 1), ('3', 2, 2),
+                ('0', 3, 0), ('TOGGLE_FR_RR', 3, 1), ('BS', 3, 2)]
+    else:
+        return [('7', 0, 0), ('8', 0, 1), ('9', 0, 2),
+                ('4', 1, 0), ('5', 1, 1), ('6', 1, 2),
+                ('1', 2, 0), ('2', 2, 1), ('3', 2, 2),
+                ('0', 3, 0), (None, 3, 1), ('BS', 3, 2)]
 
 
 def get_commit_display_style(is_half_step=False):
     """コミット番号の表示フォントと幅を返す。"""
     if is_half_step:
-        # 小数点表示 (0001.5) も FONT_HUGE (48pt) を維持し、幅は6
-        return FONT_HUGE, 6
-    return FONT_HUGE, 5
+        # "0001 Fr" / "0001 Rr" 表示用 (操作パネルに収まる 30pt)
+        return (FONT_FAMILY, 30, "bold"), 7
+    return (FONT_FAMILY, 38, "bold"), 5
 
 
 def format_commit_for_tenkey(value, is_half_step=False):
-    """テンキー入力欄の初期表示用文字列を返す（1.0 → 1、1.5 はそのまま）。"""
+    """テンキー入力欄の初期表示用文字列を返す（1.0 → 1 Fr、1.5 → 1 Rr）。"""
     try:
         num = float(value)
     except (TypeError, ValueError):
         return str(value)
     if not is_half_step:
         return str(int(num))
-    if abs(num - round(num)) < 1e-9:
-        return str(int(round(num)))
-    return f"{num:.1f}"
+    is_fr = (num % 1.0 < 0.25)
+    tag = "Fr" if is_fr else "Rr"
+    return f"{int(num)} {tag}"
 
 
 def configure_modal_toplevel(win, parent=None):
@@ -284,17 +290,31 @@ class TenKeyDialog(tk.Toplevel):
         pad = tk.Frame(self, padx=15, pady=10, bg=COLOR_BG_MAIN)
         pad.pack(fill=tk.BOTH, expand=True)
 
+        self.toggle_btn = None
         keys = get_tenkey_keys(self.is_half_step)
         for (txt, r, c) in keys:
+            if txt is None:
+                continue
             bg_color = COLOR_BG_PANEL
             if txt == 'BS':
                 bg_color = "#D32F2F"
 
-            tk.Button(pad, text=txt, font=FONT_LARGE, bg=bg_color,
-                      fg=COLOR_TEXT_MAIN, activebackground=COLOR_ACCENT,
-                      activeforeground=COLOR_BG_MAIN, relief="flat", bd=0,
-                      command=lambda t=txt: self.on_key(t)).grid(
-                row=r, column=c, sticky="nsew", padx=4, pady=4)
+            if txt == 'TOGGLE_FR_RR':
+                # 現在が Rr ならボタンは「Fr」、現在が Fr ならボタンは「Rr」を表示
+                cur_val = self.var_value.get()
+                btn_txt = "Fr" if "Rr" in cur_val else "Rr"
+                btn = tk.Button(pad, text=btn_txt, font=FONT_LARGE, bg=COLOR_BG_PANEL,
+                                fg=COLOR_ACCENT, activebackground=COLOR_ACCENT,
+                                activeforeground=COLOR_BG_MAIN, relief="flat", bd=0,
+                                command=lambda: self.on_key('TOGGLE_FR_RR'))
+                btn.grid(row=r, column=c, sticky="nsew", padx=4, pady=4)
+                self.toggle_btn = btn
+            else:
+                tk.Button(pad, text=txt, font=FONT_LARGE, bg=bg_color,
+                          fg=COLOR_TEXT_MAIN, activebackground=COLOR_ACCENT,
+                          activeforeground=COLOR_BG_MAIN, relief="flat", bd=0,
+                          command=lambda t=txt: self.on_key(t)).grid(
+                    row=r, column=c, sticky="nsew", padx=4, pady=4)
 
         tk.Button(pad, text="CLR", font=FONT_LARGE, bg="#616161",
                   fg=COLOR_TEXT_MAIN, activebackground=COLOR_ACCENT,
@@ -307,22 +327,49 @@ class TenKeyDialog(tk.Toplevel):
         for i in range(3):
             pad.columnconfigure(i, weight=1)
 
+        self._update_toggle_btn()
         self.wait_window(self)
 
+    def _update_toggle_btn(self):
+        if self.toggle_btn and self.toggle_btn.winfo_exists():
+            cur = self.var_value.get()
+            if "Rr" in cur:
+                self.toggle_btn.config(text="Fr", fg="#81D4FA")
+            else:
+                self.toggle_btn.config(text="Rr", fg=COLOR_ACCENT)
+
     def on_key(self, key):
-        cur = self.var_value.get()
+        cur = self.var_value.get().strip()
         if key == 'CLR':
             self.var_value.set("")
         elif key == 'BS':
-            self.var_value.set(cur[:-1])
-        elif key == '.5':
-            # .5 は小数点がない場合のみ末尾に追加（例: "1" → "1.5"）
-            if '.' not in cur and len(cur) >= 1:
-                self.var_value.set(cur + '.5')
-        elif len(cur) < 6:
-            # 数字キー: 既に .5 で終わっている場合は追加しない
-            if not cur.endswith('.5'):
+            if cur.endswith(" Rr") or cur.endswith(" Fr"):
+                self.var_value.set(cur[:-3].strip())
+            elif cur.endswith("Rr") or cur.endswith("Fr"):
+                self.var_value.set(cur[:-2].strip())
+            else:
+                self.var_value.set(cur[:-1])
+        elif key == 'TOGGLE_FR_RR':
+            digits = "".join(c for c in cur if c.isdigit())
+            if digits:
+                if "Rr" in cur:
+                    self.var_value.set(f"{digits} Fr")
+                else:
+                    self.var_value.set(f"{digits} Rr")
+            else:
+                if "Rr" in cur:
+                    self.var_value.set("Fr")
+                else:
+                    self.var_value.set("Rr")
+        elif len("".join(c for c in cur if c.isdigit())) < 6:
+            if self.is_half_step:
+                is_rr = ("Rr" in cur)
+                tag = "Rr" if is_rr else "Fr"
+                digits = "".join(c for c in cur if c.isdigit()) + key
+                self.var_value.set(f"{digits} {tag}")
+            else:
                 self.var_value.set(cur + key)
+        self._update_toggle_btn()
 
     def _close(self):
         release_modal_toplevel(self)
@@ -335,10 +382,15 @@ class TenKeyDialog(tk.Toplevel):
             return
 
         try:
-            if '.' in val:
-                self.result = float(val)
+            digits = "".join(c for c in val if c.isdigit())
+            if not digits:
+                self._close()
+                return
+            base_int = int(digits)
+            if "Rr" in val or ".5" in val:
+                self.result = float(base_int) + 0.5
             else:
-                self.result = int(val)
+                self.result = float(base_int) if self.is_half_step else base_int
             self._close()
         except ValueError:
             pass

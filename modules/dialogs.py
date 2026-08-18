@@ -7,6 +7,7 @@ dialogs.py - ダイアログウィンドウ (PatchCore対応版)
 import json
 import os
 import time
+import copy
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
@@ -282,6 +283,18 @@ class SystemDateTimeDialog(tk.Toplevel):
         sp_s = ttk.Spinbox(f_time, from_=0, to=59, increment=1, textvariable=self.v_sec, width=4, font=font_num)
         sp_s.pack(side=tk.LEFT, padx=4)
         tk.Label(f_time, text="秒", font=font_lbl, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT)
+
+        # 全Spinboxの安全停止ハンドラ
+        for sp in [sp_y, sp_m, sp_d, sp_h, sp_mi, sp_s]:
+            def _stop_ttk_sp(event=None, widget=sp):
+                try:
+                    rep = widget.tk.call('set', '::ttk::spinbox::Repeater')
+                    if rep: widget.tk.call('after', 'cancel', rep)
+                except Exception:
+                    pass
+            sp.bind("<ButtonRelease-1>", _stop_ttk_sp, add="+")
+            sp.bind("<Leave>", _stop_ttk_sp, add="+")
+            sp.bind("<FocusOut>", _stop_ttk_sp, add="+")
 
         def _set_current():
             n = datetime.now()
@@ -587,7 +600,21 @@ class SettingsDialog(tk.Toplevel):
     def _spinbox(self, parent, var, from_, to, increment=1, width=6, key_path=None):
         sb = tk.Spinbox(parent, from_=from_, to=to, increment=increment, textvariable=var,
                         font=FONT_SET_VAL, width=width, bg=COLOR_BG_INPUT, fg="white", 
-                        buttonbackground="#78909C", bd=1, relief="solid")
+                        buttonbackground="#78909C", bd=1, relief="solid",
+                        repeatdelay=0, repeatinterval=0)
+        
+        # ラズパイ環境での長押しタイマー暴走を防止する安全ハンドラ
+        def _stop_repeat(event=None):
+            try:
+                rep_id = sb.tk.call('set', '::tk::spinbox::Repeater')
+                if rep_id:
+                    sb.tk.call('after', 'cancel', rep_id)
+            except Exception:
+                pass
+        sb.bind("<ButtonRelease-1>", _stop_repeat, add="+")
+        sb.bind("<Leave>", _stop_repeat, add="+")
+        sb.bind("<FocusOut>", _stop_repeat, add="+")
+
         if key_path:
             def _trace(*args):
                 self._mark_changed()
@@ -1299,11 +1326,20 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(self.pat_body, text="トリガー別 判定モデル・しきい値設定", font=FONT_SET_LBL,
                  bg=COLOR_BG_MAIN, fg=COLOR_ACCENT).pack(anchor="w", pady=(10, 5))
 
-        for t in self.temp_data["gpio"]["triggers"]:
+        is_half_step = bool(self.temp_data.get("system", {}).get("commit_half_step", False))
+
+        def _create_trigger_card(t):
             tid = t["id"]
             if tid not in p["stages"]:
                 p["stages"][tid] = {"conditions": {}}
             st = p["stages"][tid]
+
+            # ドアライン対応時、conditions_fr / conditions_rr が未作成なら初期化
+            if is_half_step:
+                if "conditions_fr" not in st:
+                    st["conditions_fr"] = copy.deepcopy(st.get("conditions", {}))
+                if "conditions_rr" not in st:
+                    st["conditions_rr"] = copy.deepcopy(st.get("conditions", {}))
             
             cf_outer = tk.Frame(self.pat_body, bg="#808080", padx=1, pady=1)
             cf_outer.pack(fill=tk.X, pady=8)
@@ -1316,17 +1352,21 @@ class SettingsDialog(tk.Toplevel):
                      bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT)
             
             cond_container = tk.Frame(cf_inner, bg=COLOR_BG_PANEL)
-            cond_container.pack(fill=tk.X, pady=10)
 
-            def _refresh_conditions(container=cond_container, stage=st, trigger_id=tid):
-                for w in container.winfo_children(): w.destroy()
-                
+            def _build_table(target_frame, part="fr"):
+                for w in target_frame.winfo_children():
+                    w.destroy()
+
+                cond_key = "conditions"
+                if is_half_step:
+                    cond_key = "conditions_fr" if part == "fr" else "conditions_rr"
+
                 # PatchCore用の構造調整（辞書形式）
-                if not isinstance(stage.get("conditions"), dict):
-                    stage["conditions"] = {}
+                if not isinstance(st.get(cond_key), dict):
+                    st[cond_key] = {}
                 
                 # テーブルヘッダー
-                header_f = tk.Frame(container, bg=COLOR_BG_PANEL)
+                header_f = tk.Frame(target_frame, bg=COLOR_BG_PANEL)
                 header_f.pack(fill=tk.X, pady=(0, 5))
                 
                 tk.Label(header_f, text="対象カメラ", font=FONT_BOLD, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_SUB, width=15, anchor="w").pack(side=tk.LEFT, padx=5)
@@ -1335,12 +1375,12 @@ class SettingsDialog(tk.Toplevel):
 
                 for c in self.temp_data["cameras"]:
                     c_id = str(c["id"])
-                    c_cond = stage["conditions"].setdefault(c_id, {"model_path": "", "threshold": 0.49})
+                    c_cond = st[cond_key].setdefault(c_id, {"model_path": "", "threshold": 0.49})
                     if not isinstance(c_cond, dict):
                         c_cond = {"model_path": "", "threshold": 0.49}
-                        stage["conditions"][c_id] = c_cond
+                        st[cond_key][c_id] = c_cond
                         
-                    row_f = tk.Frame(container, bg=COLOR_BG_PANEL)
+                    row_f = tk.Frame(target_frame, bg=COLOR_BG_PANEL)
                     row_f.pack(fill=tk.X, pady=4)
                     
                     # 対象カメラ名
@@ -1363,7 +1403,7 @@ class SettingsDialog(tk.Toplevel):
                             var.set(p)
                             self._mark_changed()
                     
-                    btn_browse = tk.Button(row_f, text="参照", command=_pick_model, font=FONT_NORMAL, bg=COLOR_BG_INPUT, fg=COLOR_ACCENT, relief="flat", padx=6)
+                    btn_browse = tk.Button(row_f, text="参照", command=_pick_model, font=FONT_NORMAL, bg=COLOR_BG_INPUT, fg=COLOR_ACCENT, relief="flat", padx=6, takefocus=False)
                     btn_browse.pack(side=tk.LEFT, padx=2)
                     Tooltip(btn_browse, "PatchCoreモデルファイル (.ckpt) を参照して選択します")
                     
@@ -1401,12 +1441,60 @@ class SettingsDialog(tk.Toplevel):
                             
                         self.test_patchcore_live(cam_obj, model_path, threshold)
                         
-                    btn_test = tk.Button(row_f, text="テスト", font=FONT_BTN_LARGE, bg=COLOR_ACCENT, fg="black", relief="flat")
+                    btn_test = tk.Button(row_f, text="テスト", font=FONT_BTN_LARGE, bg=COLOR_ACCENT, fg="black", relief="flat", takefocus=False)
                     btn_test.pack(side=tk.LEFT, padx=10)
                     btn_test.config(command=_test_pc)
                     Tooltip(btn_test, "現在のカメラ映像に対し選択されたPatchCoreモデルでリアルタイム判定テストを行います")
 
-            _refresh_conditions()
+            def _update_canvas_scroll():
+                if hasattr(self, "pat_canvas") and self.pat_canvas.winfo_exists():
+                    self.pat_canvas.configure(scrollregion=self.pat_canvas.bbox("all"))
+
+            cond_container.pack(fill=tk.X, pady=10)
+
+            if is_half_step:
+                frame_fr = tk.Frame(cond_container, bg=COLOR_BG_PANEL)
+                frame_rr = tk.Frame(cond_container, bg=COLOR_BG_PANEL)
+
+                _build_table(frame_fr, "fr")
+                _build_table(frame_rr, "rr")
+
+                # 初期表示は Fr
+                frame_fr.pack(fill=tk.X)
+
+                part_frm = tk.Frame(head_f, bg=COLOR_BG_PANEL)
+                part_frm.pack(side=tk.RIGHT)
+
+                btn_fr = tk.Button(part_frm, text="Fr 判定条件", font=FONT_BOLD, width=11, relief="flat", takefocus=False)
+                btn_rr = tk.Button(part_frm, text="Rr 判定条件", font=FONT_BOLD, width=11, relief="flat", takefocus=False)
+
+                def _show_fr():
+                    frame_rr.pack_forget()
+                    frame_fr.pack(fill=tk.X)
+                    btn_fr.config(bg=COLOR_ACCENT, fg="black")
+                    btn_rr.config(bg=COLOR_BG_INPUT, fg=COLOR_TEXT_MAIN)
+                    _update_canvas_scroll()
+
+                def _show_rr():
+                    frame_fr.pack_forget()
+                    frame_rr.pack(fill=tk.X)
+                    btn_rr.config(bg=COLOR_ACCENT, fg="black")
+                    btn_fr.config(bg=COLOR_BG_INPUT, fg=COLOR_TEXT_MAIN)
+                    _update_canvas_scroll()
+
+                btn_fr.config(command=_show_fr)
+                btn_rr.config(command=_show_rr)
+                btn_fr.pack(side=tk.LEFT, padx=(0, 4))
+                btn_rr.pack(side=tk.LEFT)
+                btn_fr.config(bg=COLOR_ACCENT, fg="black")
+                btn_rr.config(bg=COLOR_BG_INPUT, fg=COLOR_TEXT_MAIN)
+            else:
+                frame_single = tk.Frame(cond_container, bg=COLOR_BG_PANEL)
+                _build_table(frame_single, "single")
+                frame_single.pack(fill=tk.X)
+
+        for t in self.temp_data["gpio"]["triggers"]:
+            _create_trigger_card(t)
 
         self.after(50, lambda: self.pat_canvas.configure(scrollregion=self.pat_canvas.bbox("all")) if hasattr(self, "pat_canvas") and self.pat_canvas.winfo_exists() else None)
         self.after(60, lambda: self.pat_canvas.yview_moveto(y_pos) if hasattr(self, "pat_canvas") and self.pat_canvas.winfo_exists() else None)
@@ -1869,13 +1957,14 @@ class SettingsDialog(tk.Toplevel):
         r_step = _row_frame(g6)
         v_step = tk.BooleanVar(value=bool(st_sys.get("commit_half_step", False)))
         cb_step = tk.Checkbutton(
-            r_step, text="コミット番号を0.5刻みで進める",
+            r_step, text="ドアライン対応 (Fr/Rr 分割判定 & 0.5刻みコミット)",
             variable=v_step, onvalue=True, offvalue=False,
             font=FONT_SET_VAL, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN,
             activebackground=COLOR_BG_PANEL, activeforeground=COLOR_TEXT_MAIN,
             selectcolor=COLOR_BG_INPUT, relief="flat"
         )
         cb_step.pack(side=tk.LEFT)
+        Tooltip(cb_step, "チェックを入れると、コミット番号が 0.5 刻み (Fr/Rr表記) で進み、パターン判定条件を Fr と Rr で個別に設定できます。")
         
         def _format_delay_value(val, half_step):
             try: num = float(val)
@@ -2129,17 +2218,20 @@ class SettingsDialog(tk.Toplevel):
                 p["stages"] = {}
                 
             for tid, stage in p["stages"].items():
-                if "conditions" not in stage:
-                    stage["conditions"] = {}
-                    
-                if isinstance(stage["conditions"], list):
-                    stage["conditions"] = {}
-                    
-                for cam in self.temp_data["cameras"]:
-                    c_id = str(cam["id"])
-                    c_cond = stage["conditions"].get(c_id)
-                    if not isinstance(c_cond, dict):
-                        stage["conditions"][c_id] = {"model_path": "", "threshold": 0.49}
+                for ck in ("conditions", "conditions_fr", "conditions_rr"):
+                    if ck in stage:
+                        if not isinstance(stage[ck], dict):
+                            stage[ck] = {}
+                        for cam in self.temp_data["cameras"]:
+                            c_id = str(cam["id"])
+                            c_cond = stage[ck].get(c_id)
+                            if not isinstance(c_cond, dict):
+                                stage[ck][c_id] = {"model_path": "", "threshold": 0.49}
+                    elif ck == "conditions":
+                        stage["conditions"] = {}
+                        for cam in self.temp_data["cameras"]:
+                            c_id = str(cam["id"])
+                            stage["conditions"][c_id] = {"model_path": "", "threshold": 0.49}
 
     def validate_pins(self):
         used_pins = {}
