@@ -2,6 +2,14 @@
 
 本アプリケーションの変更履歴を記録します。
 
+## [2026-08-25] v0.0.8 - 設定ダイアログでの sys モジュール未定義例外 (NameError) の修正
+
+### 修正 (Fixed)
+
+- **設定ダイアログ (`SettingsDialog`) 開取時の NameError 例外修正**: `modules/dialogs.py` のトップレベルで `import sys` が欠落していたため、設定ダイアログ（「システムツール & メンテナンス」タブ）内でOS判定 (`sys.platform.startswith("win")`) を行う際に発生していた `NameError: name 'sys' is not defined` クラッシュを解消しました。
+
+---
+
 ## [2026-08-18] v0.0.7 - ドアラインFr/Rr対応・スピンボックス暴走防止修正
 
 ### 追加 (Added)

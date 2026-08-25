@@ -6,6 +6,7 @@ dialogs.py - ダイアログウィンドウ (PatchCore対応版)
 
 import json
 import os
+import sys
 import time
 import copy
 import tkinter as tk
