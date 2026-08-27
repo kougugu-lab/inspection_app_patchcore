@@ -552,6 +552,17 @@ class SettingsDialog(tk.Toplevel):
         release_modal_toplevel(self)
         if hasattr(self, "_live_preview_win") and self._live_preview_win.winfo_exists():
             self._live_preview_win.destroy()
+        if hasattr(self.master, "app_instance"):
+            app = self.master.app_instance
+            if hasattr(app, "reset_test_outputs"):
+                app.reset_test_outputs()
+        if hasattr(self, "_test_devices"):
+            for dev in self._test_devices.values():
+                try:
+                    dev.off()
+                except Exception:
+                    pass
+            self._test_devices.clear()
         if self.on_close_callback:
             self.on_close_callback()
         
@@ -937,27 +948,48 @@ class SettingsDialog(tk.Toplevel):
             e.grid(row=row, column=1, padx=10)
             e.bind("<FocusIn>", lambda ev: self._set_active_entry(e, var))
             
-            btn = tk.Button(parent, text="テスト点灯", font=FONT_NORMAL, bg="#546E7A", fg="white", relief="flat")
+            active_color = COLOR_OK if key == "ok" else COLOR_NG
+            active_fg = "black" if key == "ok" else "white"
+
+            btn = tk.Button(parent, text="テスト点灯", font=FONT_NORMAL, bg="#546E7A", fg="white", relief="flat", padx=6)
             btn.grid(row=row, column=2, padx=5)
             
             led = tk.Canvas(parent, width=20, height=20, bg=COLOR_BG_PANEL, highlightthickness=0)
             led.grid(row=row, column=3, padx=5)
             circle = led.create_oval(2, 2, 18, 18, fill="#333", outline="#555")
             
-            def _toggle_test(v=var, l=led, c=circle, b=btn):
-                app = getattr(self.master, "app_instance", None)
-                if not app: return
-                pin = 0
-                try: pin = int(v.get())
-                except: return
+            def _toggle_test(v=var, l=led, c=circle, b=btn, act_color=active_color, act_fg=active_fg):
+                try:
+                    pin = int(v.get().strip())
+                except (ValueError, TypeError):
+                    return
                 
                 cur_color = l.itemcget(c, "fill")
-                if cur_color == "#333":
-                    l.itemconfig(c, fill=COLOR_OK)
+                turn_on = (cur_color == "#333")
+
+                app = getattr(self.master, "app_instance", None)
+                if app and hasattr(app, "toggle_output_pin_by_num"):
+                    app.toggle_output_pin_by_num(pin, turn_on)
+                else:
+                    from .hardware import OutputDevice
+                    if not hasattr(self, "_test_devices"):
+                        self._test_devices = {}
+                    if pin not in self._test_devices:
+                        self._test_devices[pin] = OutputDevice(pin)
+                    if turn_on:
+                        self._test_devices[pin].on()
+                    else:
+                        self._test_devices[pin].off()
+
+                if turn_on:
+                    l.itemconfig(c, fill=act_color)
+                    b.config(bg=act_color, fg=act_fg)
                 else:
                     l.itemconfig(c, fill="#333")
+                    b.config(bg="#546E7A", fg="white")
             
             btn.config(command=_toggle_test)
+            Tooltip(btn, f"{label}の物理/仮想ピンをON/OFFトグル点灯テストします。")
 
         _make_out_row(f_out, "OK出力:", self.v_ok, 0, "ok")
         Tooltip(f_out.grid_slaves(row=0, column=0)[0], "OK判定時に信号を出すGPIOピンです。")
@@ -1371,7 +1403,7 @@ class SettingsDialog(tk.Toplevel):
                 header_f.pack(fill=tk.X, pady=(0, 5))
                 
                 tk.Label(header_f, text="対象カメラ", font=FONT_BOLD, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_SUB, width=15, anchor="w").pack(side=tk.LEFT, padx=5)
-                tk.Label(header_f, text="PatchCoreモデルファイル (.ckpt)", font=FONT_BOLD, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_SUB, width=32, anchor="w").pack(side=tk.LEFT, padx=5)
+                tk.Label(header_f, text="モデルファイル", font=FONT_BOLD, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_SUB, width=32, anchor="w").pack(side=tk.LEFT, padx=5)
                 tk.Label(header_f, text="判定しきい値", font=FONT_BOLD, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_SUB, width=12, anchor="w").pack(side=tk.LEFT, padx=5)
 
                 for c in self.temp_data["cameras"]:
@@ -1391,14 +1423,14 @@ class SettingsDialog(tk.Toplevel):
                     v_path = tk.StringVar(value=c_cond.get("model_path", ""))
                     e_path = tk.Entry(row_f, textvariable=v_path, font=FONT_SET_VAL, width=32, bg=COLOR_BG_INPUT, fg=COLOR_TEXT_MAIN, insertbackground="white", relief="flat")
                     e_path.pack(side=tk.LEFT, padx=5)
-                    Tooltip(e_path, "PatchCoreモデルファイル (.ckpt) のパスを入力または参照ボタンで選択します (未指定時はSKIP判定)")
+                    Tooltip(e_path, "モデルファイルのパスを入力または参照ボタンで選択します。未指定時は検査対象外となります。")
                     
                     # 参照ボタン
                     def _pick_model(var=v_path):
                         p = filedialog.askopenfilename(
-                            title="PatchCoreモデルファイルを選択",
+                            title="モデルファイルを選択",
                             parent=self,
-                            filetypes=[("Anomalib checkpoint", "*.ckpt"), ("すべてのファイル", "*.*")]
+                            filetypes=[("学習済みモデル", "*.ckpt"), ("すべてのファイル", "*.*")]
                         )
                         if p:
                             var.set(p)
@@ -1406,13 +1438,13 @@ class SettingsDialog(tk.Toplevel):
                     
                     btn_browse = tk.Button(row_f, text="参照", command=_pick_model, font=FONT_NORMAL, bg=COLOR_BG_INPUT, fg=COLOR_ACCENT, relief="flat", padx=6, takefocus=False)
                     btn_browse.pack(side=tk.LEFT, padx=2)
-                    Tooltip(btn_browse, "PatchCoreモデルファイル (.ckpt) を参照して選択します")
+                    Tooltip(btn_browse, "モデルファイルを参照して選択します。")
                     
                     # 個別しきい値スライダー
                     v_thr = tk.StringVar(value=str(c_cond.get("threshold", 0.49)))
                     sp_thr = self._spinbox(row_f, v_thr, 0.0, 1.0, 0.01, width=8)
                     sp_thr.pack(side=tk.LEFT, padx=10)
-                    Tooltip(sp_thr, "異常判定しきい値を設定します (アノマリスコアがこの値以上でNG判定)")
+                    Tooltip(sp_thr, "異常判定しきい値を設定します。スコアがこの値以上でNG判定となります。")
                     
                     def _make_updater(cid=c_id, vp=v_path, vt=v_thr, cond_dict=c_cond):
                         def _update(*args):
@@ -1437,7 +1469,7 @@ class SettingsDialog(tk.Toplevel):
                             threshold = 0.49
                             
                         if not model_path or not os.path.exists(model_path):
-                            messagebox.showerror("エラー", "モデルファイル (.ckpt) が選択されていないか、ファイルが存在しません。", parent=self)
+                            messagebox.showerror("エラー", "モデルファイルが選択されていないか、ファイルが存在しません。", parent=self)
                             return
                             
                         self.test_patchcore_live(cam_obj, model_path, threshold)
@@ -1547,14 +1579,20 @@ class SettingsDialog(tk.Toplevel):
             if ret:
                 try:
                     if app:
-                        score, amap = app.predict_patchcore(model_pc, frame)
-                        overlay = app.generate_heatmap_overlay(frame, amap)
+                        score_raw, amap = app.predict_patchcore(model_pc, frame)
+                        min_area = int(self.temp_data.get("inference", {}).get("min_defect_area", 15))
+                        min_len = int(self.temp_data.get("inference", {}).get("min_defect_length", 5))
+                        is_abnormal, defect_score, defect_boxes = app.evaluate_anomaly_clusters(
+                            amap, threshold, min_defect_area=min_area, min_defect_length=min_len
+                        )
+                        score = defect_score if is_abnormal else score_raw
+                        overlay = app.generate_heatmap_overlay(frame, amap, defect_boxes=defect_boxes)
                     else:
                         score, amap = self._predict_patchcore_fallback(model_pc, frame)
+                        is_abnormal = score >= threshold
                         overlay = self._generate_heatmap_fallback(frame, amap)
                         
-                    is_abnormal = score >= threshold
-                    res_str = "異常 (Abnormal)" if is_abnormal else "正常 (Normal)"
+                    res_str = "異常 (NG)" if is_abnormal else "正常 (OK)"
                     res_color = COLOR_NG if is_abnormal else COLOR_OK
                     
                     lbl_info.config(text=f"判定: {res_str}　スコア: {score:.4f} (しきい値: {threshold:.2f})", fg=res_color)
@@ -1821,7 +1859,80 @@ class SettingsDialog(tk.Toplevel):
                     except Exception: pass
                     self._mark_changed()
                 return _upd
-            v.trace_add("write", _mk_upd())
+        # グループ1-2: 微小欠陥検査・位置ズレ対策設定
+        g1_2 = _make_group(scroll_f, "微小欠陥検査 & 位置ズレ対策設定", pady=(10, 4))
+
+        # タイル分割推論チェックボックス
+        r_tile = _row_frame(g1_2)
+        v_tiling = tk.BooleanVar(value=bool(s.get("tiling_enabled", True)))
+        cb_tiling = tk.Checkbutton(
+            r_tile, text="高解像度タイル分割推論を有効化",
+            variable=v_tiling, font=FONT_NORMAL,
+            bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN,
+            activebackground=COLOR_BG_PANEL, activeforeground=COLOR_TEXT_MAIN,
+            selectcolor=COLOR_BG_INPUT
+        )
+        cb_tiling.pack(side=tk.LEFT)
+        Tooltip(cb_tiling, "高解像度画像を複数タイルに分割して推論し、微小な傷が縮小で潰れるのを防止します。")
+
+        def _upd_tiling(*a):
+            s["tiling_enabled"] = v_tiling.get()
+            self._mark_changed()
+        v_tiling.trace_add("write", _upd_tiling)
+
+        # タイルサイズ & 重なり率
+        r_ts = _row_frame(g1_2)
+        _lbl(r_ts, "タイル解像度:", "分割推論時の1タイルのピクセルサイズです。通常は512。")
+        v_ts = tk.StringVar(value=str(s.get("tile_size", 512)))
+        sp_ts = self._spinbox(r_ts, v_ts, 256, 1024, 64, width=8)
+        sp_ts.pack(side=tk.LEFT)
+        _unit(r_ts, "px")
+        def _upd_ts(*a):
+            try: s["tile_size"] = int(v_ts.get())
+            except Exception: pass
+            self._mark_changed()
+        v_ts.trace_add("write", _upd_ts)
+
+        # 最小欠陥面積 & 最小欠陥長（クラスタリング判定）
+        r_area = _row_frame(g1_2)
+        _lbl(r_area, "最小欠陥面積:", "点ノイズや反射ムラを除外するための最小連続欠陥ピクセル数です。")
+        v_area = tk.StringVar(value=str(s.get("min_defect_area", 15)))
+        sp_area = self._spinbox(r_area, v_area, 1, 500, 1, width=8)
+        sp_area.pack(side=tk.LEFT)
+        _unit(r_area, "px")
+        Tooltip(sp_area, "これ未満の点ノイズは無視します。")
+        def _upd_area(*a):
+            try: s["min_defect_area"] = int(v_area.get())
+            except Exception: pass
+            self._mark_changed()
+        v_area.trace_add("write", _upd_area)
+
+        r_len = _row_frame(g1_2)
+        _lbl(r_len, "最小欠陥長さ:", "線状の傷を検出するための最小長軸ピクセル長です。")
+        v_len = tk.StringVar(value=str(s.get("min_defect_length", 5)))
+        sp_len = self._spinbox(r_len, v_len, 1, 200, 1, width=8)
+        sp_len.pack(side=tk.LEFT)
+        _unit(r_len, "px")
+        Tooltip(sp_len, "傷の対角線・長さの基準ピクセル数です。")
+        def _upd_len(*a):
+            try: s["min_defect_length"] = int(v_len.get())
+            except Exception: pass
+            self._mark_changed()
+        v_len.trace_add("write", _upd_len)
+
+        # エッジ除外マージン（搬送位置ズレ対策）
+        r_edge = _row_frame(g1_2)
+        _lbl(r_edge, "外形エッジ除外幅:", "搬送位置ズレ時に対象物の外周エッジ部での誤検知を防ぐ侵食マージンです。")
+        v_edge = tk.StringVar(value=str(s.get("edge_margin_px", 12)))
+        sp_edge = self._spinbox(r_edge, v_edge, 0, 50, 1, width=8)
+        sp_edge.pack(side=tk.LEFT)
+        _unit(r_edge, "px")
+        Tooltip(sp_edge, "輪郭境界の誤検知をカットするマージン幅です。")
+        def _upd_edge(*a):
+            try: s["edge_margin_px"] = int(v_edge.get())
+            except Exception: pass
+            self._mark_changed()
+        v_edge.trace_add("write", _upd_edge)
 
         # グループ2: 出力制御
         g2 = _make_group(scroll_f, "出力制御")
@@ -1842,7 +1953,8 @@ class SettingsDialog(tk.Toplevel):
         v_ng_t = tk.StringVar(value=str(s.get("ng_output_time", "")))
         ng_sp = self._spinbox(r_ng, v_ng_t, 0.0, 60.0, 0.1, width=8)
         ng_sp.pack(side=tk.LEFT)
-        _unit(r_ng, "秒（空欄時は停止ボタンまで保持）")
+        _unit(r_ng, "秒")
+        Tooltip(ng_sp, "空欄時はブザー停止ボタンが押されるまで出力を保持します。")
         def _upd_ng_t(*a):
             val = v_ng_t.get().strip()
             try: s["ng_output_time"] = float(val) if val else ""
@@ -1887,7 +1999,7 @@ class SettingsDialog(tk.Toplevel):
         g4 = _make_group(scroll_f, "音声設定")
 
         r_bng = _row_frame(g4)
-        _lbl(r_bng, "NG時ブザー音:", "不合格（異常検出）時に鳴らす音声パス。")
+        _lbl(r_bng, "NG時ブザー音:", "不合格時に鳴らす音声ファイルのパスです。")
         vb = tk.StringVar(value=s.get("buzzer_path", ""))
         _entry_w(r_bng, vb, width=35)
         _browse_btn(r_bng, vb, mode="file", filetypes=[("音声ファイル", "*.mp3 *.wav *.ogg"), ("すべて", "*.*")])
@@ -1895,7 +2007,7 @@ class SettingsDialog(tk.Toplevel):
         vb.trace_add("write", lambda *a: s.update({"buzzer_path": vb.get()}))
 
         r_bok = _row_frame(g4)
-        _lbl(r_bok, "OK時ブザー音:", "合格（正常判定）時に鳴らす音声パス。")
+        _lbl(r_bok, "OK時ブザー音:", "合格時に鳴らす音声ファイルのパスです。")
         vob = tk.StringVar(value=s.get("ok_buzzer_path", ""))
         _entry_w(r_bok, vob, width=35)
         _browse_btn(r_bok, vob, mode="file", filetypes=[("音声ファイル", "*.mp3 *.wav *.ogg"), ("すべて", "*.*")])
@@ -1947,7 +2059,7 @@ class SettingsDialog(tk.Toplevel):
                 else:
                     self.after(0, lambda: v_used.set("現在の使用量: -"))
             except Exception:
-                self.after(0, lambda: v_used.set("(使用量の取得に失敗しました)"))
+                self.after(0, lambda: v_used.set("使用量の取得に失敗しました"))
 
         threading.Thread(target=_calc_storage, daemon=True).start()
 
@@ -1958,14 +2070,14 @@ class SettingsDialog(tk.Toplevel):
         r_step = _row_frame(g6)
         v_step = tk.BooleanVar(value=bool(st_sys.get("commit_half_step", False)))
         cb_step = tk.Checkbutton(
-            r_step, text="ドアライン対応 (Fr/Rr 分割判定 & 0.5刻みコミット)",
+            r_step, text="前後分割判定モードを有効化",
             variable=v_step, onvalue=True, offvalue=False,
             font=FONT_SET_VAL, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN,
             activebackground=COLOR_BG_PANEL, activeforeground=COLOR_TEXT_MAIN,
             selectcolor=COLOR_BG_INPUT, relief="flat"
         )
         cb_step.pack(side=tk.LEFT)
-        Tooltip(cb_step, "チェックを入れると、コミット番号が 0.5 刻み (Fr/Rr表記) で進み、パターン判定条件を Fr と Rr で個別に設定できます。")
+        Tooltip(cb_step, "チェックを入れると、コミット番号が前後分割表記で進み、判定条件を個別に設定できます。")
         
         def _format_delay_value(val, half_step):
             try: num = float(val)
@@ -1980,10 +2092,12 @@ class SettingsDialog(tk.Toplevel):
             half = v_step.get()
             if half:
                 delay_sp.config(from_=0.0, to=99.0, increment=0.5)
-                delay_unit_lbl.config(text="サイクル（0.5刻みで設定可能、0で遅延なし）")
+                delay_unit_lbl.config(text="サイクル")
+                Tooltip(delay_sp, "0.5刻みで設定可能です。0で遅延なしとなります。")
             else:
                 delay_sp.config(from_=0, to=99, increment=1)
-                delay_unit_lbl.config(text="サイクル（整数のみ、0で遅延なし）")
+                delay_unit_lbl.config(text="サイクル")
+                Tooltip(delay_sp, "整数値で設定します。0で遅延なしとなります。")
 
         def _upd_step(*a):
             st_sys["commit_half_step"] = v_step.get()
@@ -1998,14 +2112,14 @@ class SettingsDialog(tk.Toplevel):
         v_step.trace_add("write", _upd_step)
 
         r_delay = _row_frame(g6)
-        _lbl(r_delay, "仕様情報遅延サイクル数:", "トリガー時に取得した仕様情報を、何サイクル（コミット数）後に実際の検査に適用するか。")
+        _lbl(r_delay, "仕様情報遅延サイクル数:", "取得した仕様情報を何サイクル後に実際の検査へ適用するか設定します。")
         half_init = bool(st_sys.get("commit_half_step", False))
         v_delay = tk.StringVar(value=_format_delay_value(st_sys.get("delay_cycles", 0), half_init))
         self._last_valid_delay_str = v_delay.get()
         self._delay_revert_guard = False
         delay_sp = self._spinbox(r_delay, v_delay, 0.0, 99.0, 0.5, width=8)
         delay_sp.pack(side=tk.LEFT)
-        delay_unit_lbl = _unit(r_delay, "サイクル（0.5刻みで設定可能、0で遅延なし）")
+        delay_unit_lbl = _unit(r_delay, "サイクル")
         _apply_delay_spinbox_mode()
 
         def _upd_delay(*a):
@@ -2364,7 +2478,19 @@ class SettingsDialog(tk.Toplevel):
         self.settings.save_settings()
 
         if hasattr(self.master, "app_instance"):
-            self.master.app_instance.reset_delay_pattern_queue() # type: ignore
+            app = self.master.app_instance
+            if hasattr(app, "reset_delay_pattern_queue"):
+                app.reset_delay_pattern_queue()
+            if hasattr(app, "reset_test_outputs"):
+                app.reset_test_outputs()
+
+        if hasattr(self, "_test_devices"):
+            for dev in self._test_devices.values():
+                try:
+                    dev.off()
+                except Exception:
+                    pass
+            self._test_devices.clear()
 
         if hasattr(self, "_live_preview_win") and self._live_preview_win.winfo_exists():
             self._live_preview_win.destroy()

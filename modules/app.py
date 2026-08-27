@@ -253,11 +253,8 @@ class InspectionSystem:
             self.logger.error(f"AIモデルのロードに失敗しました: {model_path} - {e}")
             return None
 
-    def predict_patchcore(self, model, cv_img):
-        """
-        単一のCV画像に対してPatchCore推論を実行し、
-        アノマリスコア(float)とアノマリーマップ(Tensor/Array)を返します。
-        """
+    def _predict_patchcore_single(self, model, cv_img):
+        """単一画像/タイルに対してPatchCore/PaDiM推論を実行し、(score, 2D_anomaly_map) を返します"""
         if model is None:
             return 0.0, None
 
@@ -335,13 +332,206 @@ class InspectionSystem:
             if isinstance(anomaly_score, torch.Tensor):
                 anomaly_score = anomaly_score.item()
 
+            if isinstance(anomaly_map, torch.Tensor):
+                anomaly_map = anomaly_map.detach().cpu().numpy()
+
+            if anomaly_map is not None:
+                if anomaly_map.ndim == 4:
+                    anomaly_map = anomaly_map[0, 0]
+                elif anomaly_map.ndim == 3:
+                    anomaly_map = anomaly_map[0]
+
             return float(anomaly_score), anomaly_map
         except Exception as e:
-            self.logger.error(f"PatchCore推論処理で例外が発生しました: {e}")
+            self.logger.error(f"単一パッチ推論処理で例外が発生しました: {e}")
             return 0.0, None
 
-    def generate_heatmap_overlay(self, cv_img, anomaly_map):
-        """アノマリーマップ（異常度の局所分布）をサーモグラフィ風のヒートマップにして元画像に重ね合わせます"""
+    def predict_patchcore_tiled(self, model, cv_img, tile_size=512, tile_overlap=0.25):
+        """
+        高解像度画像をオーバーラップ付きタイルに分割して推論し、
+        アノマリーマップを元の座標系に高解像度でシームレス合成します。
+        これにより、微小な傷（5mm前後）が縮小によって消失するのを防ぎます。
+        """
+        img_h, img_w = cv_img.shape[:2]
+        if img_h <= tile_size and img_w <= tile_size:
+            score, amap = self._predict_patchcore_single(model, cv_img)
+            if amap is not None and (amap.shape[0] != img_h or amap.shape[1] != img_w):
+                amap = cv2.resize(amap, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
+            return score, amap
+
+        step_y = max(64, int(tile_size * (1.0 - tile_overlap)))
+        step_x = max(64, int(tile_size * (1.0 - tile_overlap)))
+
+        y_points = list(range(0, max(1, img_h - tile_size + 1), step_y))
+        if not y_points or y_points[-1] + tile_size < img_h:
+            y_points.append(max(0, img_h - tile_size))
+        x_points = list(range(0, max(1, img_w - tile_size + 1), step_x))
+        if not x_points or x_points[-1] + tile_size < img_w:
+            x_points.append(max(0, img_w - tile_size))
+
+        # 2D Hanning窓によるシームレス重み付けマスク
+        window_y = np.hanning(tile_size)
+        window_x = np.hanning(tile_size)
+        weight_2d = np.outer(window_y, window_x).astype(np.float32)
+        weight_2d = np.clip(weight_2d, 0.05, 1.0)
+
+        accum_map = np.zeros((img_h, img_w), dtype=np.float32)
+        accum_weight = np.zeros((img_h, img_w), dtype=np.float32)
+        max_score = 0.0
+
+        for y in y_points:
+            for x in x_points:
+                tile = cv_img[y:y + tile_size, x:x + tile_size]
+                t_score, t_map = self._predict_patchcore_single(model, tile)
+                if t_score > max_score:
+                    max_score = t_score
+
+                if t_map is not None:
+                    if t_map.shape[0] != tile_size or t_map.shape[1] != tile_size:
+                        t_map = cv2.resize(t_map, (tile_size, tile_size), interpolation=cv2.INTER_LINEAR)
+                    accum_map[y:y + tile_size, x:x + tile_size] += t_map * weight_2d
+                    accum_weight[y:y + tile_size, x:x + tile_size] += weight_2d
+
+        # 重みで正規化してフル解像度アノマリーマップを構築
+        accum_weight = np.maximum(accum_weight, 1e-5)
+        merged_map = accum_map / accum_weight
+        return max_score, merged_map
+
+    def apply_workpiece_edge_mask(self, cv_img, anomaly_map, edge_margin_px=12, mask_mode="auto"):
+        """
+        搬送レーン上の上下左右位置ズレ対策:
+        ワーク表面領域を自動抽出し、外形エッジ部（境界の明暗差）を侵食（Erode）して
+        輪郭シフトによるエッジ擬似異常（誤検知・偽陽性）をシャットアウトします。
+        """
+        if anomaly_map is None or mask_mode == "none":
+            return anomaly_map
+
+        try:
+            h, w = anomaly_map.shape[:2]
+            gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+            if gray.shape[:2] != (h, w):
+                gray = cv2.resize(gray, (w, h), interpolation=cv2.INTER_LINEAR)
+
+            # ガウシアンブラーで高周波ノイズを除去した上でワーク領域マスクを生成
+            blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+            _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # ワーク領域が黒基調か白基調かを四隅の背景輝度から自動判定
+            corners = [thresh[0, 0], thresh[0, -1], thresh[-1, 0], thresh[-1, -1]]
+            bg_val = 255 if np.mean(corners) > 127 else 0
+            work_mask = (thresh != bg_val).astype(np.uint8) * 255
+
+            # 最大輪郭のみを対象物（ワーク）領域として抽出
+            contours, _ = cv2.findContours(work_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                max_cnt = max(contours, key=cv2.contourArea)
+                refined_mask = np.zeros((h, w), dtype=np.uint8)
+                cv2.drawContours(refined_mask, [max_cnt], -1, 255, -1)
+            else:
+                refined_mask = work_mask
+
+            # エッジ侵食（外形輪郭から指定ピクセル数内側の検査領域のみを有効化）
+            if edge_margin_px > 0:
+                k_size = max(3, edge_margin_px * 2 + 1)
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+                eroded_mask = cv2.erode(refined_mask, kernel)
+            else:
+                eroded_mask = refined_mask
+
+            mask_norm = (eroded_mask > 0).astype(np.float32)
+            masked_anomaly_map = anomaly_map * mask_norm
+            return masked_anomaly_map
+        except Exception as e:
+            self.logger.warning(f"ワーク領域エッジマスク処理をスキップしました: {e}")
+            return anomaly_map
+
+    def evaluate_anomaly_clusters(self, anomaly_map, threshold, min_defect_area=15, min_defect_length=5):
+        """
+        空間クラスタリング・傷形状判定（Connected Component Analysis）:
+        単一の最大値（Max score）依存を脱却し、指定サイズ（面積・長さ）以上の
+        連続した異常領域（傷・打痕）が存在するかどうかで真の異常を判定します。
+        微小な点ノイズ・照明反射ムラは自動除外されます。
+        """
+        if anomaly_map is None:
+            return False, 0.0, []
+
+        try:
+            # 閾値以上の画素を2値化
+            binary_map = (anomaly_map >= threshold).astype(np.uint8) * 255
+            if not np.any(binary_map):
+                return False, float(np.max(anomaly_map)), []
+
+            # 1〜2ピクセルの微小孤立ノイズをモルフォロジー演算（オープニング）で除去
+            kernel_3x3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            clean_binary = cv2.morphologyEx(binary_map, cv2.MORPH_OPEN, kernel_3x3)
+
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(clean_binary, connectivity=8)
+
+            defect_boxes = []
+            max_defect_score = 0.0
+            has_real_defect = False
+
+            # label 0 は背景のため 1 から走査
+            for i in range(1, num_labels):
+                area = stats[i, cv2.CC_STAT_AREA]
+                x = stats[i, cv2.CC_STAT_LEFT]
+                y = stats[i, cv2.CC_STAT_TOP]
+                w = stats[i, cv2.CC_STAT_WIDTH]
+                h = stats[i, cv2.CC_STAT_HEIGHT]
+                diagonal = np.sqrt(w**2 + h**2)
+
+                # 該当クラスタ内の最大異常スコア
+                cluster_mask = (labels == i)
+                cluster_score = float(np.max(anomaly_map[cluster_mask])) if np.any(cluster_mask) else 0.0
+
+                # 面積または長さ（対角線長）が基準を満たす場合に真の欠陥と判定
+                if area >= min_defect_area or diagonal >= min_defect_length:
+                    has_real_defect = True
+                    defect_boxes.append((x, y, w, h, cluster_score, area))
+                    if cluster_score > max_defect_score:
+                        max_defect_score = cluster_score
+
+            if not has_real_defect:
+                # 基準サイズを満たすクラスタがない場合はOK判定（最大値も参考値として返却）
+                return False, float(np.max(anomaly_map)), []
+
+            return True, max_defect_score, defect_boxes
+        except Exception as e:
+            self.logger.error(f"アノマリークラスタ判定で例外が発生しました: {e}")
+            is_abnormal = float(np.max(anomaly_map)) >= threshold
+            return is_abnormal, float(np.max(anomaly_map)), []
+
+    def predict_patchcore(self, model, cv_img):
+        """
+        PatchCore推論の統合エントリポイント:
+        設定（タイル分割、ワークマスク、クラスタ判定）に応じて高精度推論を実行します。
+        """
+        if model is None:
+            return 0.0, None
+
+        cfg = self.settings.data.get("inference", {})
+        tiling_enabled = cfg.get("tiling_enabled", True)
+        tile_size = int(cfg.get("tile_size", 512))
+        tile_overlap = float(cfg.get("tile_overlap", 0.25))
+        edge_margin_px = int(cfg.get("edge_margin_px", 12))
+        mask_mode = cfg.get("mask_mode", "auto")
+
+        if tiling_enabled:
+            score, anomaly_map = self.predict_patchcore_tiled(model, cv_img, tile_size=tile_size, tile_overlap=tile_overlap)
+        else:
+            score, anomaly_map = self._predict_patchcore_single(model, cv_img)
+
+        # 位置ズレ・エッジ誤検知防止マスクの適用
+        if anomaly_map is not None:
+            anomaly_map = self.apply_workpiece_edge_mask(cv_img, anomaly_map, edge_margin_px=edge_margin_px, mask_mode=mask_mode)
+
+        return score, anomaly_map
+
+    def generate_heatmap_overlay(self, cv_img, anomaly_map, defect_boxes=None):
+        """
+        アノマリーマップ（異常度の局所分布）をサーモグラフィ風ヒートマップにして元画像に重ね合わせ、
+        検出された欠陥クラスタが存在する場合は赤色バウンディングボックスでハイライト表示します。
+        """
         if anomaly_map is None:
             return cv_img.copy()
 
@@ -349,29 +539,41 @@ class InspectionSystem:
             if isinstance(anomaly_map, torch.Tensor):
                 anomaly_map = anomaly_map.detach().cpu().numpy()
 
-            # 次元数を2次元 [H, W] にスクイーズ
             if anomaly_map.ndim == 4:
                 anomaly_map = anomaly_map[0, 0]
             elif anomaly_map.ndim == 3:
                 anomaly_map = anomaly_map[0]
 
-            # 異常度の正規化 (0.0〜1.0 -> 0〜255)
-            amin, amax = anomaly_map.min(), anomaly_map.max()
+            amin, amax = float(anomaly_map.min()), float(anomaly_map.max())
             if amax - amin > 1e-5:
                 norm_map = (anomaly_map - amin) / (amax - amin)
             else:
                 norm_map = anomaly_map
-            norm_map = (norm_map * 255).astype(np.uint8)
+            norm_map = (np.clip(norm_map, 0.0, 1.0) * 255).astype(np.uint8)
 
-            # 元画像の大きさにヒートマップをリサイズ
             h, w = cv_img.shape[:2]
             heatmap = cv2.resize(norm_map, (w, h), interpolation=cv2.INTER_LINEAR)
-
-            # JETカラーマップを適用してRGB画像化
             heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
 
-            # 元画像とカラーヒートマップを60:40でブレンド（重み付け合成）
+            # 元画像とヒートマップを60:40で合成
             overlay = cv2.addWeighted(cv_img, 0.6, heatmap_color, 0.4, 0)
+
+            # 検出された傷・欠陥領域にバウンディングボックスとラベルを描画
+            if defect_boxes:
+                for box in defect_boxes:
+                    bx, by, bw, bh = box[0], box[1], box[2], box[3]
+                    b_score = box[4] if len(box) > 4 else 0.0
+                    # マップサイズから元画像サイズへの座標スケーリング
+                    mh, mw = anomaly_map.shape[:2]
+                    scale_x, scale_y = w / mw, h / mh
+                    sx, sy = int(bx * scale_x), int(by * scale_y)
+                    sw, sh = int(bw * scale_x), int(bh * scale_y)
+
+                    cv2.rectangle(overlay, (sx, sy), (sx + sw, sy + sh), (0, 0, 255), 2)
+                    label_text = f"NG ({b_score:.2f})"
+                    cv2.putText(overlay, label_text, (sx, max(18, sy - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+
             return overlay
         except Exception as e:
             self.logger.error(f"アノマリーマップ可視化生成エラー: {e}")
@@ -604,7 +806,7 @@ class InspectionSystem:
                                    bg=COLOR_BG_INPUT, fg=COLOR_ACCENT)
         self.update_commit_display()
         self.lbl_commit.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6)
-        Tooltip(self.lbl_commit, "現在のコミット番号（検査サイクル識別番号）です")
+        Tooltip(self.lbl_commit, "現在のコミット番号です")
 
         btn_num = tk.Button(pnl, text="番号入力", font=FONT_NORMAL, bg="#546E7A",
                             fg="white", relief="flat",
@@ -883,6 +1085,52 @@ class InspectionSystem:
             self.out_ng.off()
         if PYGAME_AVAILABLE and pygame.mixer.get_init():
             pygame.mixer.music.stop()
+
+    def toggle_output_pin_by_num(self, pin: int, turn_on: bool) -> bool:
+        """設定画面からのテスト点灯（物理/仮想ピンのON/OFFトグル切替）"""
+        try:
+            if not hasattr(self, "_test_output_devices"):
+                self._test_output_devices = {}
+
+            target_dev = None
+            for dev in (getattr(self, "out_ok", None), getattr(self, "out_ng", None)):
+                if dev and hasattr(dev, "pin") and str(dev.pin) == str(pin):
+                    target_dev = dev
+                    break
+
+            if target_dev is None:
+                if pin in self._test_output_devices:
+                    target_dev = self._test_output_devices[pin]
+                else:
+                    target_dev = OutputDevice(pin)
+                    self._test_output_devices[pin] = target_dev
+
+            if turn_on:
+                target_dev.on()
+            else:
+                target_dev.off()
+            self.logger.info(f"出力ピン BCM {pin} テスト点灯: {'ON' if turn_on else 'OFF'}")
+            return True
+        except Exception as e:
+            self.logger.error(f"出力ピンテストエラー (BCM {pin}): {e}")
+            return False
+
+    def reset_test_outputs(self):
+        """テスト点灯用に出力したピンをすべて消灯(OFF)にする"""
+        try:
+            if getattr(self, "out_ok", None):
+                self.out_ok.off()
+            if getattr(self, "out_ng", None):
+                self.out_ng.off()
+            if hasattr(self, "_test_output_devices"):
+                for dev in self._test_output_devices.values():
+                    try:
+                        dev.off()
+                    except Exception:
+                        pass
+                self._test_output_devices.clear()
+        except Exception as e:
+            self.logger.error(f"テスト出力リセットエラー: {e}")
 
     def clear_history(self):
         if messagebox.askyesno("確認", "NG履歴を削除しますか？"):
@@ -1305,15 +1553,23 @@ class InspectionSystem:
                         model_pc = self.get_patchcore_model(model_path)
                         if model_pc is not None:
                             try:
-                                score, anomaly_map = self.predict_patchcore(model_pc, frame)
-                                is_abnormal = score >= threshold
+                                score_raw, anomaly_map = self.predict_patchcore(model_pc, frame)
+                                
+                                # 微小傷・クラスタサイズ判定
+                                min_area = int(d.get("inference", {}).get("min_defect_area", 15))
+                                min_len = int(d.get("inference", {}).get("min_defect_length", 5))
+                                is_abnormal, defect_score, defect_boxes = self.evaluate_anomaly_clusters(
+                                    anomaly_map, threshold, min_defect_area=min_area, min_defect_length=min_len
+                                )
+                                score = defect_score if is_abnormal else score_raw
+                                
                                 # 正常(OK)、異常(NG)の割り当て
                                 res_type = "NG" if is_abnormal else "OK"
                                 cond_summary = f"閾値={threshold:.4f}"
-                                det_summary = f"スコア={score:.4f}"
+                                det_summary = f"スコア={score:.4f}" + (f" (欠陥数:{len(defect_boxes)})" if is_abnormal else "")
                                 
-                                # アノマリーヒートマップの可視化重ね合わせ画像を生成
-                                frame_to_save = self.generate_heatmap_overlay(frame, anomaly_map)
+                                # アノマリーヒートマップおよび傷検出矩形を描画した画像を生成
+                                frame_to_save = self.generate_heatmap_overlay(frame, anomaly_map, defect_boxes=defect_boxes)
                             except Exception as e:
                                 self.logger.error(f"PatchCore推論プロセスでエラー: {e}")
                                 res_type = "NG"

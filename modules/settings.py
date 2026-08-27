@@ -71,7 +71,14 @@ class SettingsManager:
                 "preview_fps": 10,
                 "ok_output_time": 0.5,
                 "ng_output_time": "",
-                "ng_output_hold": False
+                "ng_output_hold": False,
+                "tiling_enabled": True,
+                "tile_size": 512,
+                "tile_overlap": 0.25,
+                "min_defect_area": 15,
+                "min_defect_length": 5,
+                "edge_margin_px": 12,
+                "mask_mode": "auto"
             },
             "storage": {
                 "results_dir": os.path.join(os.path.expanduser("~"), "results"),
