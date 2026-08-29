@@ -55,7 +55,8 @@ class SettingsManager:
                     {"id": "sel_2", "name": "ピン 2", "pin": 6},
                     {"id": "sel_3", "name": "ピン 3", "pin": 13}
                 ],
-                "outputs": {"ok": 16, "ng": 20}
+                "outputs": {"ok": 16, "ng": 20},
+                "reset_pin": 23
             },
             "patterns": pats,
             "pattern_order": ["pat_1", "pat_2", "pat_3", "pat_4"],

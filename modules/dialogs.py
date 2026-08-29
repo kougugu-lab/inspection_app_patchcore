@@ -433,6 +433,15 @@ class GPIOTestDialog(tk.Toplevel):
             for s in self.gpio_settings.get("pattern_pins", []):
                 self.inputs[s["id"]] = DigitalInputDevice(s["pin"], pull_up=True)
                 self.input_names[s["id"]] = f"パターンピン: {s['name']} (ピン:{s['pin']})"
+            reset_pin = self.gpio_settings.get("reset_pin")
+            if reset_pin:
+                try:
+                    r_num = int(reset_pin)
+                    if r_num > 0:
+                        self.inputs["reset"] = DigitalInputDevice(r_num, pull_up=True)
+                        self.input_names["reset"] = f"NGリセット入力 (ピン:{r_num})"
+                except Exception:
+                    pass
             self.outputs["ok"] = OutputDevice(self.gpio_settings["outputs"]["ok"])
             self.outputs["ng"] = OutputDevice(self.gpio_settings["outputs"]["ng"])
         except Exception as e:
@@ -495,6 +504,8 @@ class SettingsDialog(tk.Toplevel):
         
         self.v_ok = tk.IntVar(value=self.temp_data["gpio"]["outputs"]["ok"])
         self.v_ng = tk.IntVar(value=self.temp_data["gpio"]["outputs"]["ng"])
+        reset_val = self.temp_data["gpio"].get("reset_pin", 23)
+        self.v_reset_pin = tk.StringVar(value=str(reset_val if reset_val is not None else 23))
 
         style = ttk.Style()
         style.theme_use('clam')
@@ -932,6 +943,26 @@ class SettingsDialog(tk.Toplevel):
         btn_add_s.pack(anchor="e", pady=5)
         Tooltip(btn_add_s, "パターンを切り替えるための入力ピンを追加します。")
 
+        # NGリセット入力設定
+        outer_r, inner_r = create_card(self.trig_scroll, "NGリセット入力")
+        outer_r.pack(fill=tk.X, pady=10)
+        f_reset = tk.Frame(inner_r, bg=COLOR_BG_PANEL)
+        f_reset.pack(fill=tk.X, pady=5)
+        
+        # 状態表示(LED) - 入力側は左端に配置
+        self.led_reset = tk.Canvas(f_reset, width=16, height=16, bg=COLOR_BG_PANEL, highlightthickness=0)
+        self.led_reset.pack(side=tk.LEFT, padx=5)
+        self.circle_reset = self.led_reset.create_oval(2, 2, 14, 14, fill="#333", outline="#555")
+        Tooltip(self.led_reset, "リセットピンの現在の入力状態（通電時に緑色点灯）です。")
+
+        l_rst = tk.Label(f_reset, text="リセットピン:", font=FONT_SET_VAL, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN)
+        l_rst.pack(side=tk.LEFT, padx=(5, 2))
+        Tooltip(l_rst, "外部スイッチ等からNG出力・ブザー音を手動停止/リセットするための入力ピン番号 (BCM番号) です。")
+
+        e_reset = self._entry(f_reset, self.v_reset_pin, width=5, key_path="gpio.reset_pin")
+        e_reset.pack(side=tk.LEFT, padx=5)
+        e_reset.bind("<FocusIn>", lambda ev: self._set_active_entry(e_reset, self.v_reset_pin))
+
         f_mid_inner = tk.Frame(col_mid, bg=COLOR_BG_MAIN)
         f_mid_inner.pack(fill=tk.BOTH, expand=True)
         self.show_gpio_map(f_mid_inner)
@@ -1038,6 +1069,10 @@ class SettingsDialog(tk.Toplevel):
                     state = app_inputs[sid].is_active
                     led, circle = self.pin_widgets[sid]
                     led.itemconfig(circle, fill=COLOR_OK if state else "#333")
+
+            if "reset" in app_inputs and hasattr(self, "led_reset") and hasattr(self, "circle_reset") and self.led_reset.winfo_exists():
+                state = app_inputs["reset"].is_active
+                self.led_reset.itemconfig(self.circle_reset, fill=COLOR_OK if state else "#333")
 
         self.after(200, self._start_monitoring)
 
@@ -2462,6 +2497,41 @@ class SettingsDialog(tk.Toplevel):
             messagebox.showwarning("バリデーションエラー", msg, parent=self)
             return
 
+        # ピン重複チェック（トリガー、パターン切替、OK/NG出力、NGリセットピン）
+        used_pins = {}
+        for t in self.temp_data["gpio"]["triggers"]:
+            p = t["pin"]
+            if p in used_pins:
+                return messagebox.showerror("エラー", f"ピン {p} が重複しています ({used_pins[p]} と {t.get('name', 'トリガー')})", parent=self)
+            used_pins[p] = f"トリガー: {t.get('name', 'トリガー')}"
+        for s in self.temp_data["gpio"].get("pattern_pins", []):
+            p = s["pin"]
+            if p in used_pins:
+                return messagebox.showerror("エラー", f"ピン {p} が重複しています ({used_pins[p]} と {s.get('name', 'パターンピン')})", parent=self)
+            used_pins[p] = f"パターンピン: {s.get('name', 'パターンピン')}"
+        
+        ok_p = self.v_ok.get()
+        if ok_p in used_pins:
+            return messagebox.showerror("エラー", f"OK出力ピン {ok_p} が重複しています ({used_pins[ok_p]})", parent=self)
+        used_pins[ok_p] = "OK出力"
+
+        ng_p = self.v_ng.get()
+        if ng_p in used_pins:
+            return messagebox.showerror("エラー", f"NG出力ピン {ng_p} が重複しています ({used_pins[ng_p]})", parent=self)
+        used_pins[ng_p] = "NG出力"
+
+        reset_str = self.v_reset_pin.get().strip()
+        if reset_str:
+            try:
+                reset_p = int(reset_str)
+                if reset_p in used_pins:
+                    return messagebox.showerror("エラー", f"NGリセット入力ピン {reset_p} が重複しています ({used_pins[reset_p]})", parent=self)
+                self.temp_data["gpio"]["reset_pin"] = reset_p
+            except ValueError:
+                return messagebox.showerror("エラー", "NGリセットピン番号が無効です。半角数字で入力してください。", parent=self)
+        else:
+            self.temp_data["gpio"]["reset_pin"] = None
+
         res_dir = self.temp_data["storage"].get("results_dir", "")
         if res_dir:
             try:
@@ -2517,11 +2587,25 @@ class SettingsDialog(tk.Toplevel):
             used.add(s["pin"])
         if self.v_ok.get() in used or self.v_ng.get() in used:
             return messagebox.showerror("エラー", "出力ピンが重複しています")
+        used.add(self.v_ok.get())
+        used.add(self.v_ng.get())
+
+        reset_str = self.v_reset_pin.get().strip()
+        reset_p = None
+        if reset_str:
+            try:
+                reset_p = int(reset_str)
+                if reset_p in used:
+                    return messagebox.showerror("エラー", f"NGリセット入力ピン {reset_p} が重複しています")
+                used.add(reset_p)
+            except ValueError:
+                return messagebox.showerror("エラー", "NGリセットピン番号が無効です")
 
         test_gpio = {
             "triggers": self.temp_data["gpio"]["triggers"],
             "pattern_pins": self.temp_data["gpio"].get("pattern_pins", []),
-            "outputs": {"ok": self.v_ok.get(), "ng": self.v_ng.get()}
+            "outputs": {"ok": self.v_ok.get(), "ng": self.v_ng.get()},
+            "reset_pin": reset_p
         }
         if hasattr(self.master, "app_instance"):
             app = self.master.app_instance

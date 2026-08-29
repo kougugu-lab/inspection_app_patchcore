@@ -73,6 +73,7 @@ class InspectionSystem:
         self.outputs = {}
         self.out_ok = None
         self.out_ng = None
+        self.ng_off_after_id = None
 
         self.cycle_active_pat_id = None  
         self.cycle_fired_trigs = set()   
@@ -639,6 +640,18 @@ class InspectionSystem:
             for s in data["gpio"].get("pattern_pins", []):
                 self.inputs[f"sel_{s['id']}"] = DigitalInputDevice(s["pin"], pull_up=True, bounce_time=0.05)
 
+            reset_pin = data["gpio"].get("reset_pin")
+            if reset_pin:
+                try:
+                    pin_num = int(reset_pin)
+                    if pin_num > 0:
+                        dev_reset = DigitalInputDevice(pin_num, pull_up=True, bounce_time=0.05)
+                        dev_reset.when_activated = self.stop_buzzer
+                        self.inputs["reset"] = dev_reset
+                        self.logger.info(f"NGリセット入力ピン初期化: BCM {pin_num}")
+                except Exception as e:
+                    self.logger.error(f"NGリセット入力ピン初期化失敗: {e}")
+
             self.out_ok = OutputDevice(data["gpio"]["outputs"]["ok"])
             self.out_ng = OutputDevice(data["gpio"]["outputs"]["ng"])
             self.outputs = {"ok": self.out_ok, "ng": self.out_ng}
@@ -1081,10 +1094,24 @@ class InspectionSystem:
             self.logger.error(f"初期コミット番号設定エラー: {e}")
 
     def stop_buzzer(self):
+        """NG出力・ブザーを停止する（画面ボタンクリックまたはGPIOリセット入力）"""
+        if getattr(self, "ng_off_after_id", None):
+            try:
+                self.root.after_cancel(self.ng_off_after_id)
+            except Exception:
+                pass
+            self.ng_off_after_id = None
         if self.out_ng:
-            self.out_ng.off()
+            try:
+                self.out_ng.off()
+            except Exception:
+                pass
         if PYGAME_AVAILABLE and pygame.mixer.get_init():
-            pygame.mixer.music.stop()
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+        self.logger.info("NG出力・ブザーを停止しました（手動/GPIOリセット）")
 
     def toggle_output_pin_by_num(self, pin: int, turn_on: bool) -> bool:
         """設定画面からのテスト点灯（物理/仮想ピンのON/OFFトグル切替）"""
@@ -1792,11 +1819,20 @@ class InspectionSystem:
 
             if self.out_ng:
                 ng_hold = bool(inference_cfg.get("ng_output_hold", False))
+                if getattr(self, "ng_off_after_id", None):
+                    try:
+                        self.root.after_cancel(self.ng_off_after_id)
+                    except Exception:
+                        pass
+                    self.ng_off_after_id = None
+
                 if ng_hold:
+                    # 常時出力（ブザー停止ボタンまたはGPIOリセットで手動OFF）
                     self.out_ng.on()
                 else:
                     ng_time_str = str(ng_time).strip() if ng_time is not None else ""
                     if ng_time_str == "":
+                        # 空白設定: 常時出力（ブザー停止ボタンまたはGPIOリセットで手動OFF）
                         self.out_ng.on()
                     else:
                         try:
@@ -1807,7 +1843,8 @@ class InspectionSystem:
                                 def _ng_off():
                                     if self.out_ng:
                                         self.out_ng.off()
-                                self.root.after(max(10, ng_msec), _ng_off)
+                                    self.ng_off_after_id = None
+                                self.ng_off_after_id = self.root.after(max(10, ng_msec), _ng_off)
                         except ValueError:
                             pass
 
