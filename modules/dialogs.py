@@ -991,7 +991,8 @@ class SettingsDialog(tk.Toplevel):
             
             def _toggle_test(v=var, l=led, c=circle, b=btn, act_color=active_color, act_fg=active_fg):
                 try:
-                    pin = int(v.get().strip())
+                    raw = v.get() if hasattr(v, "get") else v
+                    pin = int(str(raw).strip())
                 except (ValueError, TypeError):
                     return
                 
@@ -1049,31 +1050,45 @@ class SettingsDialog(tk.Toplevel):
 
     def _start_monitoring(self):
         if not self.winfo_exists():
-            return
-        if not hasattr(self, "t_gpio") or not self.t_gpio.winfo_exists():
-            return
+            return  # ダイアログ自体が閉じた場合のみ停止
 
-        app = getattr(self.master, "app_instance", None)
-        app_inputs = getattr(app, "inputs", {}) # type: ignore
-        if app_inputs:
-            for t in self.temp_data["gpio"]["triggers"]:
-                tid = t["id"]
-                if tid in app_inputs and tid in self.pin_widgets:
-                    state = app_inputs[tid].is_active
-                    led, circle = self.pin_widgets[tid]
-                    led.itemconfig(circle, fill=COLOR_OK if state else "#333")
-            
-            for s in self.temp_data["gpio"].get("pattern_pins", []):
-                sid = f"sel_{s['id']}"
-                if sid in app_inputs and sid in self.pin_widgets:
-                    state = app_inputs[sid].is_active
-                    led, circle = self.pin_widgets[sid]
-                    led.itemconfig(circle, fill=COLOR_OK if state else "#333")
+        try:
+            app = getattr(self.master, "app_instance", None)
+            app_inputs = getattr(app, "inputs", {})
 
-            if "reset" in app_inputs and hasattr(self, "led_reset") and hasattr(self, "circle_reset") and self.led_reset.winfo_exists():
-                state = app_inputs["reset"].is_active
-                self.led_reset.itemconfig(self.circle_reset, fill=COLOR_OK if state else "#333")
+            if app_inputs:
+                for t in self.temp_data["gpio"]["triggers"]:
+                    tid = t["id"]
+                    if tid in app_inputs and tid in self.pin_widgets:
+                        try:
+                            state = app_inputs[tid].is_active
+                            led, circle = self.pin_widgets[tid]
+                            led.itemconfig(circle, fill=COLOR_OK if state else "#333")
+                        except Exception:
+                            pass
 
+                for s in self.temp_data["gpio"].get("pattern_pins", []):
+                    sid = f"sel_{s['id']}"
+                    if sid in app_inputs and sid in self.pin_widgets:
+                        try:
+                            state = app_inputs[sid].is_active
+                            led, circle = self.pin_widgets[sid]
+                            led.itemconfig(circle, fill=COLOR_OK if state else "#333")
+                        except Exception:
+                            pass
+
+                if "reset" in app_inputs and hasattr(self, "led_reset") and hasattr(self, "circle_reset"):
+                    try:
+                        if self.led_reset.winfo_exists():
+                            state = app_inputs["reset"].is_active
+                            self.led_reset.itemconfig(self.circle_reset, fill=COLOR_OK if state else "#333")
+                    except Exception:
+                        pass
+
+        except Exception:
+            pass  # いかなる例外もループを止めない
+
+        # ダイアログが生きている限り無条件に次の監視をスケジュール
         self.after(200, self._start_monitoring)
 
     def show_gpio_map(self, parent):
