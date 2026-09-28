@@ -656,12 +656,57 @@ class InspectionSystem:
             self.out_ng = OutputDevice(data["gpio"]["outputs"]["ng"])
             self.outputs = {"ok": self.out_ok, "ng": self.out_ng}
 
+            # Linux環境でのカメラ by_path 自動マイグレーション（未設定の場合に物理USBポートを自動記憶）
+            if sys.platform.startswith("linux"):
+                by_path_dir = "/dev/v4l/by-path"
+                if os.path.exists(by_path_dir):
+                    by_path_map = {}
+                    try:
+                        for fname in sorted(os.listdir(by_path_dir)):
+                            full_p = os.path.join(by_path_dir, fname)
+                            real_p = os.path.realpath(full_p)
+                            if "index0" in fname or real_p not in by_path_map:
+                                by_path_map[real_p] = full_p
+                    except Exception:
+                        pass
+                    
+                    migrated = False
+                    for c in data["cameras"]:
+                        if not c.get("by_path"):
+                            c_idx = c.get("index", 0)
+                            dev_node = f"/dev/video{c_idx}"
+                            if dev_node in by_path_map:
+                                c["by_path"] = by_path_map[dev_node]
+                                migrated = True
+                                self.logger.info(f"カメラ '{c.get('name')}' の物理USBポート(by_path)を自動登録しました: {c['by_path']}")
+                    if migrated:
+                        self.settings.save()
+
             cap_res = data["storage"]["capture_res"]
 
-            def _open_camera(c, cap_res):
+            def _resolve_camera_index(cam_cfg):
+                """Linux環境で物理USBポート(by_path)が現在どの /dev/videoX に割り当てられているか動的に解決する"""
+                if sys.platform.startswith("linux"):
+                    b_path = cam_cfg.get("by_path")
+                    if b_path and os.path.exists(b_path):
+                        try:
+                            real_p = os.path.realpath(b_path)
+                            bname = os.path.basename(real_p)
+                            if bname.startswith("video") and bname[5:].isdigit():
+                                return int(bname[5:])
+                        except Exception:
+                            pass
                 try:
+                    return int(cam_cfg.get("index", 0))
+                except (ValueError, TypeError):
+                    return 0
+
+            def _open_camera(c, cap_res):
+                """カメラを並列で開く (起動時間短縮 & 物理USBポート永続固定)"""
+                try:
+                    target_idx = _resolve_camera_index(c)
                     backend = cv2.CAP_V4L2 if sys.platform.startswith('linux') else cv2.CAP_ANY
-                    cap = cv2.VideoCapture(int(c["index"]), backend)
+                    cap = cv2.VideoCapture(target_idx, backend)
                     if cap and cap.isOpened():
                         w, h = map(int, cap_res.split('x'))
                         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
@@ -670,11 +715,11 @@ class InspectionSystem:
                         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
                         with self.camera_lock:
                             self.caps[c["id"]] = cap
-                        self.logger.info(f"カメラ(インデックス {c['index']})を初期化しました: {c['name']}")
+                        self.logger.info(f"カメラ(インデックス {target_idx}, ポート固定: {c.get('by_path', 'なし')})を初期化しました: {c['name']}")
                     else:
-                        self.logger.error(f"カメラ(インデックス {c['index']})を開けませんでした")
+                        self.logger.error(f"カメラ(インデックス {target_idx})を開けませんでした: {c['name']}")
                 except Exception as e:
-                    self.logger.error(f"カメラ初期化エラー (インデックス {c['index']}): {e}")
+                    self.logger.error(f"カメラ初期化エラー ({c['name']}): {e}")
 
             cam_threads = [threading.Thread(target=_open_camera, args=(c, cap_res), daemon=True)
                            for c in data["cameras"]]
@@ -879,6 +924,7 @@ class InspectionSystem:
                                      selectforeground="black", relief="flat")
         self.lb_history.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.lb_history.bind("<Double-Button-1>", self.on_history_double_click)
+        self.lb_history.bind("<Return>", self.on_history_double_click)
 
         sb = tk.Scrollbar(h_frm, orient=tk.VERTICAL, command=self.lb_history.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1119,18 +1165,41 @@ class InspectionSystem:
             if not hasattr(self, "_test_output_devices"):
                 self._test_output_devices = {}
 
+            def _pin_num(dev):
+                """gpiozero の OutputDevice / MockDevice いずれでも BCM 番号 (int) を返す"""
+                p = getattr(dev, "pin", None)
+                if p is None:
+                    return -1
+                # gpiozero 実機: dev.pin は Pin オブジェクト、.number が BCM 番号
+                if hasattr(p, "number"):
+                    return int(p.number)
+                # モック: dev.pin は直接 int
+                try:
+                    return int(p)
+                except (TypeError, ValueError):
+                    return -1
+
             target_dev = None
+            # まず起動時に初期化済みの out_ok / out_ng から探す（再初期化不要）
             for dev in (getattr(self, "out_ok", None), getattr(self, "out_ng", None)):
-                if dev and hasattr(dev, "pin") and str(dev.pin) == str(pin):
+                if dev is not None and _pin_num(dev) == int(pin):
                     target_dev = dev
                     break
 
+            # 見つからなければキャッシュ済みテスト用デバイスを探す
             if target_dev is None:
                 if pin in self._test_output_devices:
                     target_dev = self._test_output_devices[pin]
                 else:
-                    target_dev = OutputDevice(pin)
-                    self._test_output_devices[pin] = target_dev
+                    # 既存デバイスを outputs 辞書からも検索
+                    for dev in self.outputs.values():
+                        if _pin_num(dev) == int(pin):
+                            target_dev = dev
+                            break
+                    # それでも見つからない場合のみ新規作成
+                    if target_dev is None:
+                        target_dev = OutputDevice(pin)
+                        self._test_output_devices[pin] = target_dev
 
             if turn_on:
                 target_dev.on()
@@ -1180,11 +1249,26 @@ class InspectionSystem:
             self.logger.error(f"結果フォルダを開けませんでした: {e}")
             messagebox.showerror("エラー", f"フォルダを開けませんでした:\n{folder}", parent=self.root)
 
-    def on_history_double_click(self, e):
+    def on_history_double_click(self, e=None):
         s = self.lb_history.curselection()
+        if not s and e is not None and hasattr(e, "y"):
+            try:
+                idx = self.lb_history.nearest(e.y)
+                if 0 <= idx < self.lb_history.size():
+                    self.lb_history.selection_clear(0, tk.END)
+                    self.lb_history.selection_set(idx)
+                    s = (idx,)
+            except Exception:
+                pass
         if not s:
             return
-        rec = self.ng_history[len(self.ng_history) - 1 - s[0]]
+
+        sel_idx = s[0]
+        target_idx = len(self.ng_history) - 1 - sel_idx
+        if target_idx < 0 or target_idx >= len(self.ng_history):
+            self.logger.warning(f"NG履歴インデックス範囲外: sel={sel_idx}, total={len(self.ng_history)}")
+            return
+        rec = self.ng_history[target_idx]
         res_dir = self.get_results_dir()
         dir_ng = res_dir / "images" / "NG"
 
@@ -1209,10 +1293,17 @@ class InspectionSystem:
             imgs = all_imgs
 
         if not imgs:
-            messagebox.showinfo("情報", f"#{commit_str} の画像ファイルが見つかりません。\n保存先: {dir_ng}")
+            messagebox.showinfo("情報", f"#{commit_str} の画像ファイルが見つかりません。\n保存先: {dir_ng}", parent=self.root)
             return
 
+        if hasattr(self, "_ng_detail_top") and self._ng_detail_top and self._ng_detail_top.winfo_exists():
+            try:
+                self._ng_detail_top.destroy()
+            except Exception:
+                pass
+
         top = tk.Toplevel(self.root)
+        self._ng_detail_top = top
         top.title(f"NG詳細 #{commit_str} ({len(imgs)}枚)")
         top.configure(bg=COLOR_BG_MAIN)
         top.transient(self.root)
@@ -1252,22 +1343,37 @@ class InspectionSystem:
         img_max_h = int(sh * 0.65)
 
         for f in imgs:
-            try:
-                im = Image.open(f)
-                im.thumbnail((img_max_w, img_max_h), Image.LANCZOS)
-                t_im = ImageTk.PhotoImage(im)
+            t_im = None
+            for retry in range(3):
+                try:
+                    if f.exists() and f.stat().st_size == 0:
+                        time.sleep(0.08)
+                        continue
+                    im = Image.open(f)
+                    im.thumbnail((img_max_w, img_max_h), Image.BILINEAR)
+                    t_im = ImageTk.PhotoImage(im)
+                    break
+                except Exception as ex:
+                    if retry < 2:
+                        time.sleep(0.1)
+                    else:
+                        self.logger.error(f"NG画像読み込みエラー: {f.name} - {ex}")
 
+            if t_im is not None:
                 tk.Label(inner, text=f.name, font=FONT_NORMAL,
                          bg=COLOR_BG_MAIN, fg=COLOR_TEXT_SUB).pack(anchor="w", padx=10, pady=(10, 2))
                 lbl = tk.Label(inner, image=t_im, bg=COLOR_BG_MAIN)
                 lbl.image = t_im  
                 lbl.pack(padx=10, pady=(0, 5))
-            except Exception as ex:
-                self.logger.error(f"NG画像読み込みエラー: {f.name} - {ex}")
 
+        def _close_top():
+            self._ng_detail_top = None
+            top.destroy()
+
+        top.protocol("WM_DELETE_WINDOW", _close_top)
         tk.Button(top, text="閉じる", font=FONT_BOLD, bg="#546E7A", fg="white",
                   relief="flat", padx=20,
-                  command=top.destroy).pack(pady=10)
+                  command=_close_top).pack(pady=10)
 
     def show_main_help(self):
         help_data = {
@@ -1764,9 +1870,6 @@ class InspectionSystem:
                                                 confidence=conf, trig_name=trig_name)
                 self.append_to_csv(pat_name, cam_name, cls_name, det_cnt, res_type, conf)
 
-                if res_type == "NG":
-                    self.add_history(trig_id) 
-
                 preview_res = self.settings.data["storage"].get("preview_res", "320x240")
                 try:
                     pw, ph = map(int, preview_res.split('x'))
@@ -1814,6 +1917,8 @@ class InspectionSystem:
 
         if has_ng:
             self.update_status(f"異常(Abnormal)検出 ({pat_name})", COLOR_NG)
+            # 1回の検査トリガーで1回のみNG履歴に追加
+            self.add_history(trig_id)
             if self.out_ok:
                 self.out_ok.off()
 

@@ -91,26 +91,42 @@ class MockInput(MockDevice):
 try:
     from gpiozero import DigitalInputDevice as _DigitalInputDevice
     from gpiozero import OutputDevice as _OutputDevice
+    # gpiozero のインポートが成功 = ラズパイ(GPIO対応)環境
     GPIO_AVAILABLE = True
 
     def DigitalInputDevice(pin, *args, **kwargs):
-        global GPIO_AVAILABLE
+        """DigitalInputDevice ラッパー。
+        ピン番号が無効 (<=0) の場合は事前にモックへフォールバック。
+        gpiozero 自体は利用可能なので GPIO_AVAILABLE は変更しない。
+        """
         try:
-            return _DigitalInputDevice(pin, *args, **kwargs)
+            p = int(pin)
+        except (TypeError, ValueError):
+            p = -1
+        if p <= 0:
+            return MockInput(p, *args, **kwargs)
+        try:
+            return _DigitalInputDevice(p, *args, **kwargs)
         except Exception as e:
-            # ピンが使えない（実機でない等）場合はモックへフォールバック
-            print(f"ピン {pin} で代替モック(MockInput)を使用します: {e}")
-            GPIO_AVAILABLE = False # 一度でもモックを使ったら可用フラグを下げる
-            return MockInput(pin, *args, **kwargs)
+            print(f"ピン {p} でDigitalInputDevice初期化失敗、モックを使用: {e}")
+            return MockInput(p, *args, **kwargs)
 
     def OutputDevice(pin, *args, **kwargs):
-        global GPIO_AVAILABLE
+        """OutputDevice ラッパー。
+        ピン番号が無効 (<=0) の場合は事前にモックへフォールバック。
+        gpiozero 自体は利用可能なので GPIO_AVAILABLE は変更しない。
+        """
         try:
-            return _OutputDevice(pin, *args, **kwargs)
+            p = int(pin)
+        except (TypeError, ValueError):
+            p = -1
+        if p <= 0:
+            return MockDevice(p, *args, **kwargs)
+        try:
+            return _OutputDevice(p, *args, **kwargs)
         except Exception as e:
-            print(f"ピン {pin} で代替モック(MockDevice)を使用します: {e}")
-            GPIO_AVAILABLE = False
-            return MockDevice(pin, *args, **kwargs)
+            print(f"ピン {p} でOutputDevice初期化失敗、モックを使用: {e}")
+            return MockDevice(p, *args, **kwargs)
 
 except ImportError:
     GPIO_AVAILABLE = False
