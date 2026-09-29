@@ -1090,18 +1090,19 @@ class InspectionSystem:
         t = threading.Thread(target=_thread_task, daemon=True)
         t.start()
 
-    def get_commit_str(self, for_ui=False):
+    def get_commit_str(self, for_ui=False, commit_val=None):
         st_sys = self.settings.data.get("system", {})
         is_half_step = bool(st_sys.get("commit_half_step", False))
+        c_num = commit_val if commit_val is not None else self.commit_number
         if is_half_step:
-            is_fr = (self.commit_number % 1.0 < 0.25)
+            is_fr = (c_num % 1.0 < 0.25)
             tag = "Fr" if is_fr else "Rr"
-            c_int = int(self.commit_number)
+            c_int = int(c_num)
             if for_ui:
                 return f"{c_int:04d} {tag}"
             return f"{c_int:04d}{tag}"
         else:
-            return f"{int(self.commit_number):04d}"
+            return f"{int(c_num):04d}"
 
     def adjust_commit(self, delta):
         st_sys = self.settings.data.get("system", {})
@@ -1279,6 +1280,20 @@ class InspectionSystem:
             except:
                 commit_str = str(rec['commit'])
         all_imgs = sorted(dir_ng.glob(f"NG_{commit_str}_*"))
+
+        # 過去のコミットズレバグに対する救済フォールバック（手前のコミット番号を探索）
+        if not all_imgs:
+            try:
+                c_val = float(rec['commit'])
+                is_half = (c_val % 1.0 != 0)
+                prev_val = c_val - (0.5 if is_half else 1.0)
+                fallback_str = self.get_commit_str(commit_val=prev_val)
+                fallback_imgs = sorted(dir_ng.glob(f"NG_{fallback_str}_*"))
+                if fallback_imgs:
+                    all_imgs = fallback_imgs
+                    self.logger.info(f"NG詳細フォールバック探索で画像を発見: #{commit_str} -> #{fallback_str}")
+            except Exception as e:
+                self.logger.debug(f"フォールバック探索例外: {e}")
 
         rec_time = rec.get("time")
         if rec_time is not None:
@@ -1495,7 +1510,7 @@ class InspectionSystem:
             time.sleep(wait_time)
 
     def save_result_images(self, result_type, frame, camera_name, pattern_name,
-                           confidence=1.0, trig_name="Trig1", burst_index=None):
+                           confidence=1.0, trig_name="Trig1", burst_index=None, commit_str=None):
         if frame is None:
             return None
 
@@ -1518,7 +1533,8 @@ class InspectionSystem:
             except Exception: pass
 
         b_suffix = f"_{burst_index:02d}" if burst_index is not None else ""
-        filename = (f"{result_type}_{self.get_commit_str()}_{pattern_name}_"
+        c_str = commit_str if commit_str is not None else self.get_commit_str()
+        filename = (f"{result_type}_{c_str}_{pattern_name}_"
                     f"{camera_name}_{trig_name}{b_suffix}_{confidence:.4f}.jpg")
 
         filename = "".join([c for c in filename if c not in '<>:"/\\|?*'])
@@ -1551,7 +1567,7 @@ class InspectionSystem:
             
         return save_path
 
-    def append_to_csv(self, pattern_name, camera_name, class_name, detected_count, res_type, confidence):
+    def append_to_csv(self, pattern_name, camera_name, class_name, detected_count, res_type, confidence, commit_str=None):
         today = datetime.datetime.now().strftime('%Y%m%d')
         now_time = datetime.datetime.now().strftime('%Y/%m/%d %H:%M:%S')
         res_dir = self.get_results_dir()
@@ -1562,7 +1578,8 @@ class InspectionSystem:
         file_exists = csv_file.exists()
         # カラム名のマッピング（PatchCore向けに調整）
         header = ["日時", "コミット番号", "パターン名", "カメラ名", "判定しきい値", "算出スコア", "判定結果", "アノマリスコア"]
-        data = [now_time, self.get_commit_str(), pattern_name, camera_name, class_name, detected_count, res_type, f"{confidence:.4f}"]
+        c_str = commit_str if commit_str is not None else self.get_commit_str()
+        data = [now_time, c_str, pattern_name, camera_name, class_name, detected_count, res_type, f"{confidence:.4f}"]
 
         def _do_csv(path, row, hdr, needs_hdr):
             try:
@@ -1608,7 +1625,7 @@ class InspectionSystem:
                 time.sleep(interval)
         return captured_frames
 
-    def _inspect_frames(self, captured_frames, mode, is_skip, pat_id, trig_id, pat_name, trig_name):
+    def _inspect_frames(self, captured_frames, mode, is_skip, pat_id, trig_id, pat_name, trig_name, commit_str=None):
         """
         [PatchCore対応版] 
         各カメラ個別に、設定されたPatchCoreモデルをロードしてアノマリスコアベースの合否判定を行います。
@@ -1670,7 +1687,8 @@ class InspectionSystem:
                     save_needed = not (is_this_cam_skip and d["storage"].get("res_record_skip", "") == "保存しない")
                     if save_needed:
                         self.save_result_images("REC", frame, cam_name, pat_name,
-                                                trig_name=trig_name, burst_index=burst_idx + 1)
+                                                trig_name=trig_name, burst_index=burst_idx + 1,
+                                                commit_str=commit_str)
                     final_best_frames[(cid, cam_name)] = (frame, frame, "OK", 0.0, "-", "0")
                 else:
                     # ---- PatchCore推論処理 ----
@@ -1844,16 +1862,21 @@ class InspectionSystem:
         trig_info = next((t for t in d["gpio"]["triggers"] if t["id"] == trig_id), None)
         trig_name = trig_info["name"].strip() if trig_info else str(trig_id)
 
+        # 今回の検査・保存に使用するコミット番号をスナップショットとして確定
+        current_commit_num = self.commit_number
+        current_commit_str = self.get_commit_str(commit_val=current_commit_num)
+
         retries = 1 if is_skip else inference_cfg.get("max_retries", 5)
         interval = inference_cfg.get("burst_interval", 0.5)
         captured_frames = self._capture_burst_images(retries, interval)
 
         results, final_best_frames = self._inspect_frames(
-            captured_frames, mode, is_skip, pat_id, trig_id, pat_name, trig_name
+            captured_frames, mode, is_skip, pat_id, trig_id, pat_name, trig_name,
+            commit_str=current_commit_str
         )
 
         if mode == "recording":
-            self.update_status(f"撮影保存完了 (#{self.get_commit_str()})", COLOR_OK)
+            self.update_status(f"撮影保存完了 (#{current_commit_str})", COLOR_OK)
             time.sleep(1)
             self.inspecting = False
             self.update_status("撮影モード 待機中", COLOR_ACCENT)
@@ -1864,11 +1887,13 @@ class InspectionSystem:
                 res_setting = d["storage"].get(f"res_{res_type.lower()}", "640x480")
                 if res_setting != "保存しない":
                     self.save_result_images(res_type, frame, cam_name, pat_name, 
-                                            confidence=conf, trig_name=trig_name)
+                                            confidence=conf, trig_name=trig_name,
+                                            commit_str=current_commit_str)
                     if res_type == "NG":
                         self.save_result_images(RESULTS_SUBDIR_NG_RAW, raw_frame, cam_name, pat_name,
-                                                confidence=conf, trig_name=trig_name)
-                self.append_to_csv(pat_name, cam_name, cls_name, det_cnt, res_type, conf)
+                                                confidence=conf, trig_name=trig_name,
+                                                commit_str=current_commit_str)
+                self.append_to_csv(pat_name, cam_name, cls_name, det_cnt, res_type, conf, commit_str=current_commit_str)
 
                 preview_res = self.settings.data["storage"].get("preview_res", "320x240")
                 try:
@@ -1882,6 +1907,91 @@ class InspectionSystem:
             display_time = d["inference"].get("result_display_time", 2.0)
             self.result_display_until = time.time() + display_time
 
+        # --- 出灯 / ブザー制御 & NG履歴追加 (検査モードのみ) ---
+        # ※ サイクル完了（adjust_commitによるコミット進行）の前に実行することで、
+        #    履歴のコミット番号と保存画像ファイルのコミット番号の完全一致を保証する
+        if mode == "inspection":
+            ok_time = inference_cfg.get("ok_output_time", 0.5)
+            ng_time = inference_cfg.get("ng_output_time", "")
+            has_ng = "NG" in results
+
+            if has_ng:
+                self.update_status(f"異常(Abnormal)検出 ({pat_name})", COLOR_NG)
+                # 1回の検査トリガーで1回のみNG履歴に追加
+                self.add_history(trig_id, commit_num=current_commit_num, commit_str=current_commit_str)
+                if self.out_ok:
+                    self.out_ok.off()
+
+                if self.out_ng:
+                    ng_hold = bool(inference_cfg.get("ng_output_hold", False))
+                    if getattr(self, "ng_off_after_id", None):
+                        try:
+                            self.root.after_cancel(self.ng_off_after_id)
+                        except Exception:
+                            pass
+                        self.ng_off_after_id = None
+
+                    if ng_hold:
+                        # 常時出力（ブザー停止ボタンまたはGPIOリセットで手動OFF）
+                        self.out_ng.on()
+                    else:
+                        ng_time_str = str(ng_time).strip() if ng_time is not None else ""
+                        if ng_time_str == "":
+                            # 空白設定: 常時出力（ブザー停止ボタンまたはGPIOリセットで手動OFF）
+                            self.out_ng.on()
+                        else:
+                            try:
+                                ng_sec = float(ng_time_str)
+                                if ng_sec > 0:
+                                    self.out_ng.on()
+                                    ng_msec = int(ng_sec * 1000)
+                                    def _ng_off():
+                                        if self.out_ng:
+                                            self.out_ng.off()
+                                        self.ng_off_after_id = None
+                                    self.ng_off_after_id = self.root.after(max(10, ng_msec), _ng_off)
+                            except ValueError:
+                                pass
+
+                bp = inference_cfg.get("buzzer_path", "")
+                if bp and PYGAME_AVAILABLE and os.path.exists(bp):
+                    try:
+                        _ensure_mixer()
+                        pygame.mixer.music.load(bp)
+                        pygame.mixer.music.play(-1)
+                    except: pass
+
+            elif results and all(r in ("OK", "SKIP") for r in results):
+                status_color = COLOR_OK if "OK" in results else COLOR_BG_PANEL
+
+                if "OK" in results:
+                    self.update_status(f"正常(Normal) OK ({pat_name})", status_color)
+                    if self.out_ng:
+                        try: self.out_ng.off()
+                        except: pass
+                    if self.out_ok:
+                        try:
+                            self.out_ok.on()
+                            ok_msec = int(ok_time * 1000)
+                            def _ok_off():
+                                try:
+                                    if self.out_ok: self.out_ok.off()
+                                except: pass
+                            self.root.after(max(10, ok_msec), _ok_off)
+                        except: pass
+
+                    ok_bp = inference_cfg.get("ok_buzzer_path", "")
+                    if ok_bp and PYGAME_AVAILABLE and os.path.exists(ok_bp):
+                        try:
+                            _ensure_mixer()
+                            pygame.mixer.music.load(ok_bp)
+                            pygame.mixer.music.play(0)
+                        except: pass
+                
+                elif "SKIP" in results:
+                    self.update_status(f"SKIP ({pat_name})", COLOR_BG_PANEL)
+
+        # --- サイクル完了判定 ---
         is_cycle_complete = required_trig_ids.issubset(self.cycle_fired_trigs)
         
         if len(trig_list) <= 1:
@@ -1908,89 +2018,6 @@ class InspectionSystem:
             next_trig_name = self._get_trig_name(next_trig_id)
             self.logger.info(f"サイクル継続中 (進捗: {len(self.cycle_fired_trigs)}/{len(required_trig_ids)}, 次待機: {next_trig_name})")
 
-        if mode != "inspection":
-            return
-
-        ok_time = inference_cfg.get("ok_output_time", 0.5)
-        ng_time = inference_cfg.get("ng_output_time", "")
-        has_ng = "NG" in results
-
-        if has_ng:
-            self.update_status(f"異常(Abnormal)検出 ({pat_name})", COLOR_NG)
-            # 1回の検査トリガーで1回のみNG履歴に追加
-            self.add_history(trig_id)
-            if self.out_ok:
-                self.out_ok.off()
-
-            if self.out_ng:
-                ng_hold = bool(inference_cfg.get("ng_output_hold", False))
-                if getattr(self, "ng_off_after_id", None):
-                    try:
-                        self.root.after_cancel(self.ng_off_after_id)
-                    except Exception:
-                        pass
-                    self.ng_off_after_id = None
-
-                if ng_hold:
-                    # 常時出力（ブザー停止ボタンまたはGPIOリセットで手動OFF）
-                    self.out_ng.on()
-                else:
-                    ng_time_str = str(ng_time).strip() if ng_time is not None else ""
-                    if ng_time_str == "":
-                        # 空白設定: 常時出力（ブザー停止ボタンまたはGPIOリセットで手動OFF）
-                        self.out_ng.on()
-                    else:
-                        try:
-                            ng_sec = float(ng_time_str)
-                            if ng_sec > 0:
-                                self.out_ng.on()
-                                ng_msec = int(ng_sec * 1000)
-                                def _ng_off():
-                                    if self.out_ng:
-                                        self.out_ng.off()
-                                    self.ng_off_after_id = None
-                                self.ng_off_after_id = self.root.after(max(10, ng_msec), _ng_off)
-                        except ValueError:
-                            pass
-
-            bp = inference_cfg.get("buzzer_path", "")
-            if bp and PYGAME_AVAILABLE and os.path.exists(bp):
-                try:
-                    _ensure_mixer()
-                    pygame.mixer.music.load(bp)
-                    pygame.mixer.music.play(-1)
-                except: pass
-
-        elif results and all(r in ("OK", "SKIP") for r in results):
-            status_color = COLOR_OK if "OK" in results else COLOR_BG_PANEL
-
-            if "OK" in results:
-                self.update_status(f"正常(Normal) OK ({pat_name})", status_color)
-                if self.out_ng:
-                    try: self.out_ng.off()
-                    except: pass
-                if self.out_ok:
-                    try:
-                        self.out_ok.on()
-                        ok_msec = int(ok_time * 1000)
-                        def _ok_off():
-                            try:
-                                if self.out_ok: self.out_ok.off()
-                            except: pass
-                        self.root.after(max(10, ok_msec), _ok_off)
-                    except: pass
-
-                ok_bp = inference_cfg.get("ok_buzzer_path", "")
-                if ok_bp and PYGAME_AVAILABLE and os.path.exists(ok_bp):
-                    try:
-                        _ensure_mixer()
-                        pygame.mixer.music.load(ok_bp)
-                        pygame.mixer.music.play(0)
-                    except: pass
-            
-            elif "SKIP" in results:
-                self.update_status(f"SKIP ({pat_name})", COLOR_BG_PANEL)
-        
         self.inspecting = False
 
     def update_status(self, text, color):
@@ -2004,12 +2031,13 @@ class InspectionSystem:
                     w.config(bg=color)
             except: pass
 
-    def add_history(self, trig_id):
+    def add_history(self, trig_id, commit_num=None, commit_str=None):
         now = datetime.datetime.now()
         t_str = now.strftime("%m/%d %H:%M:%S")
-        commit_str = self.get_commit_str()
-        self.ng_history.append({"commit": self.commit_number, "commit_str": commit_str, "trigger": trig_id, "time": now})
-        self.root.after(0, lambda: self.lb_history.insert(0, f"[{t_str}] #{commit_str} NG"))
+        c_num = commit_num if commit_num is not None else self.commit_number
+        c_str = commit_str if commit_str is not None else self.get_commit_str(commit_val=c_num)
+        self.ng_history.append({"commit": c_num, "commit_str": c_str, "trigger": trig_id, "time": now})
+        self.root.after(0, lambda: self.lb_history.insert(0, f"[{t_str}] #{c_str} NG"))
 
     def clear_trigger_queue(self):
         while not self.trigger_queue.empty():
